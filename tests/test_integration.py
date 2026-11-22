@@ -273,5 +273,32 @@ class ScreenTest(unittest.TestCase):
         self.assertTrue(any("Human Review" in s.value for s in at.subheader))
 
 
+class PublicAppStructureTest(unittest.TestCase):
+    """공개 앱은 정규식 검사에 기대지 않고, 외부 API 클라이언트를 아예 불러오지 못하게 구조적으로 막는다."""
+
+    def test_app_never_loads_api_clients_or_sdk_runner(self):
+        import ast
+        import subprocess
+        root = Path(__file__).resolve().parents[1]
+        banned = {"agents", "openai", "httpx", "requests", "urllib3", "dotenv"}
+        for name in ("app.py", "src/voc/analysis_request.py", "src/voc/pipeline.py", "src/voc/stats.py"):
+            tree = ast.parse((root / name).read_text(encoding="utf-8"))
+            for node in ast.walk(tree):
+                modules = ([a.name for a in node.names] if isinstance(node, ast.Import)
+                           else [node.module or ""] if isinstance(node, ast.ImportFrom) else [])
+                self.assertFalse({m.split(".")[0] for m in modules} & banned, f"{name}: 금지된 import")
+        code = ("import sys; sys.path[:0]=['src','.']; import app; "
+                "bad=[m for m in ('agents','openai','httpx','requests') if m in sys.modules]; "
+                "print('BAD', bad) if bad else print('CLEAN')")
+        out = subprocess.run([sys.executable, "-c", code], cwd=root, capture_output=True, text=True,
+                             env={**__import__("os").environ, "OPENAI_API_KEY": "sk-test-not-real"}, check=True)
+        self.assertIn("CLEAN", out.stdout)
+
+    def test_app_has_no_env_or_key_reads(self):
+        text = (Path(__file__).resolve().parents[1] / "app.py").read_text(encoding="utf-8")
+        for token in ("getenv", "os.environ", "SdkRunner", "secrets"):
+            self.assertNotIn(token, text)
+
+
 if __name__ == "__main__":
     unittest.main()

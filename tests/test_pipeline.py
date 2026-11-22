@@ -64,6 +64,32 @@ class PipelineTest(unittest.TestCase):
         self.assertEqual(prior[S.WRITER_REVISION].text, latest.output_text)
         return final
 
+    def manager_step(self, final):
+        runner = self.ctx.runner
+        assert isinstance(runner, Mock)
+        steps = [call.args[0] for call in runner.run_stage.call_args_list]
+        return next(step for step in steps if step.stage is S.MANAGER)
+
+    def test_manager_receives_actual_human_decisions_without_free_text(self):
+        final = self.run_two_revisions(V.APPROVABLE)
+        step = self.manager_step(final)
+        self.assertEqual(step.human_reviews, ((1, D.REQUEST_REVISION), (2, D.APPROVE_AS_IS)))
+        self.assertIsNone(step.human_notes)
+        report = next(e for e in final.stages if e.stage is S.MANAGER).output_text
+        self.assertIn("1회차 Writer에게 수정 요청, 2회차 수정 없이 승인", report)
+        self.assertNotIn("미확인", report.split("재검수 결과")[1].split("##")[0])
+        self.assertNotIn("메모", report)
+
+    def test_manager_report_states_approve_as_is_decision(self):
+        self.ctx.runner = Mock(wraps=FakeRunner())
+        first = advance(self.result, self.ctx)
+        final = advance(first, self.ctx, HumanInput(D.APPROVE_AS_IS))
+        step = self.manager_step(final)
+        self.assertEqual(step.human_reviews, ((1, D.APPROVE_AS_IS),))
+        report = next(e for e in final.stages if e.stage is S.MANAGER).output_text
+        self.assertIn("Human Review 결정: 1회차 수정 없이 승인", report)
+        self.assertNotIn("Human Review 미확인", report)
+
     def test_two_revisions_use_nine_calls(self):
         final = self.run_two_revisions(V.APPROVABLE)
         self.assertIs(next_step(final).stage, S.FINAL_APPROVAL)

@@ -61,23 +61,28 @@ def _model_input(
 ) -> StageInput:
     previous: dict[StageName, str] = {}
     notes = None
+    reviews: list[tuple[int, HumanDecision]] = []
     latest_version = 0
     for entry in result.stages:
         if entry.status is not StageStatus.SUCCEEDED:
             continue
         if entry.stage in WRITER_STAGES:
             latest_version = entry.artifact_version
+        if entry.stage is StageName.HUMAN_REVIEW and entry.human_decision is not None:
+            reviews.append((entry.round_no, entry.human_decision))
         if entry.output_text is None:
             continue
         if entry.stage in MODEL_STAGES:
             previous[entry.stage] = entry.output_text
-        elif entry.stage is StageName.HUMAN_REVIEW and entry.round_no == round_no:
-            notes = ctx.to_checked(entry.output_text)
+        elif (entry.stage is StageName.HUMAN_REVIEW and entry.round_no == round_no
+              and stage is StageName.WRITER_REVISION):
+            notes = ctx.to_checked(entry.output_text)   # 자유 메모는 수정 지시를 받는 Writer(수정)에게만 전달
 
     version = round_no + 1 if stage in WRITER_STAGES else latest_version
     return StageInput(
         stage, round_no, version, ctx.sanitized,
         tuple((name, ctx.to_checked(output)) for name, output in previous.items()), notes,
+        tuple(reviews) if stage is StageName.MANAGER else (),
     )
 
 

@@ -329,6 +329,7 @@ class StageInput:
     sanitized: SanitizedInput
     prior_outputs: tuple = ()          # ((StageName, CheckedText), ...)
     human_notes: CheckedText | None = None
+    human_reviews: tuple = ()          # ((회차, HumanDecision), ...) — 사람이 실제로 내린 결정(자유 문장 없음)
 
     def __post_init__(self):
         _require(isinstance(self.stage, StageName), "stage는 StageName이어야 합니다.")
@@ -343,6 +344,9 @@ class StageInput:
             "prior_outputs는 모델 단계의 산출물만 담을 수 있습니다.")
         _require(self.human_notes is None or isinstance(self.human_notes, CheckedText),
                  "human_notes는 CheckedText여야 합니다.")
+        _require(isinstance(self.human_reviews, tuple) and all(
+            isinstance(h, tuple) and len(h) == 2 and _is_int(h[0]) and isinstance(h[1], HumanDecision)
+            for h in self.human_reviews), "human_reviews는 (회차, HumanDecision) 튜플이어야 합니다.")
 
     def texts(self) -> tuple:
         notes = (self.human_notes,) if self.human_notes else ()

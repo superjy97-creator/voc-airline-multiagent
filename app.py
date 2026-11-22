@@ -191,8 +191,11 @@ def start_run(stats, source_kind, scenario, period, request):
     st.session_state.runs = st.session_state.get("runs", 0) + 1
     result = new_run(f"dryrun-{st.session_state.runs}", (to_provenance(stats),))
     sanitized = to_sanitized_monthly(stats, source_kind, period=period, request=request)
+    runner = FakeRunner(SCENARIOS[scenario])
+    if type(runner) is not FakeRunner:       # 공개 앱은 가짜 러너만 허용한다(구조적 차단)
+        raise RuntimeError("공개 앱은 DRY_RUN 가짜 러너만 사용할 수 있습니다.")
     ctx = RunContext(
-        sanitized=sanitized, runner=FakeRunner(SCENARIOS[scenario]),
+        sanitized=sanitized, runner=runner,
         budget=CallBudget(DRY_RUN_LIMITS), to_checked=make_checked_text,
     )
     st.session_state.ctx = ctx

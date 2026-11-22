@@ -35,6 +35,16 @@ class _ReviewOutput:
     output_text: str
 
 
+_DECISION_TEXT = {"approve_as_is": "수정 없이 승인", "request_revision": "Writer에게 수정 요청"}
+
+
+def _human_line(step: StageInput) -> str:
+    if not step.human_reviews:
+        return "Human Review 기록이 입력에 없습니다."
+    parts = [f"{r}회차 {_DECISION_TEXT.get(d.value, d.value)}" for r, d in step.human_reviews]
+    return "Human Review 결정: " + ", ".join(parts)
+
+
 def _facts(step: StageInput) -> dict | None:
     """분석 요청 모드(분석_요청 필드와 월별 값이 있을 때)의 사실. 입력 필드의 값만 계산에 쓴다."""
     fields = dict(step.sanitized.fields)
@@ -161,7 +171,7 @@ class FakeRunner:
             return _report(
                 ("검수된 보고서 요약", f"요청 ‘{facts['request']}’에 대한 월별 집계 검토 예시입니다."),
                 ("개선 우선순위", "급증한 달의 원인 자료 확인 → 모니터링 기준 합의 → 변화 관찰"),
-                ("재검수 결과", "단계 기록에서 검수 판정을 확인합니다."),
+                ("재검수 결과", _human_line(step)),
                 ("미해결 위험", "원인과 개선 효과는 통계로 확인할 수 없습니다."),
                 ("사용자 최종 확인 필요사항", "보고서 및 검수 이력을 확인합니다."),
             )
@@ -187,7 +197,7 @@ class FakeRunner:
             return _report(
                 ("검수된 보고서 요약", "VOC 집계 검토 예시입니다."),
                 ("개선 우선순위", "자료 범위와 집계 기준을 먼저 확인합니다."),
-                ("재검수 결과", "단계 기록에서 검수 판정을 확인합니다."),
+                ("재검수 결과", _human_line(step)),
                 ("미해결 위험", "원인과 영향은 미확인입니다."),
                 ("사용자 최종 확인 필요사항", "보고서 및 검수 이력을 확인합니다."),
             )
@@ -246,6 +256,7 @@ class SdkRunner:
             },
             "prior_outputs": {stage.value: checked.text for stage, checked in step.prior_outputs},
             "human_notes": step.human_notes.text if step.human_notes is not None else None,
+            "human_reviews": [{"round_no": r, "decision": d.value} for r, d in step.human_reviews],
         }
         serialized = json.dumps(payload, ensure_ascii=False)
         if self.max_input_chars is not None and len(serialized) > self.max_input_chars:
