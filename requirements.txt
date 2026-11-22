@@ -1,3 +1,4 @@
-# Streamlit 화면(DRY_RUN 시연) 실행에 필요한 패키지
+# Streamlit 화면 실행에 필요한 패키지(DRY_RUN은 아래 두 개만 사용, LIVE는 openai-agents도 사용)
 streamlit>=1.50
 pandas>=2.2,<4
+openai-agents==0.25.0

@@ -123,6 +123,12 @@ class LiveServiceTest(unittest.TestCase):
             with self.subTest(address=address, host=host, path=path):
                 self.assertFalse(svc.local_access(address, host, path))
 
+    def test_viewer_access_requires_a_platform_verified_email(self):
+        self.assertTrue(svc.viewer_access("someone@example.com"))
+        for bad in (None, "", "   ", "no-at-sign", "a b@c.com", 123, "x" * 300):
+            with self.subTest(email=bad):
+                self.assertFalse(svc.viewer_access(bad))
+
     def test_gate_issues_tokens_only_when_allowed_and_expires(self):
         closed = svc.LocalGate(False)
         self.assertIsNone(closed.issue())

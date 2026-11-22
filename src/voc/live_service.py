@@ -1,8 +1,9 @@
 """웹 LIVE 서비스(합성 데이터 전용): 관리자 인증·승인 코드·1회 실행 장부·중복 호출 방지.
 
 원칙(모두 서버 측에서 강제):
-- 접근 제한: 비밀번호 없이, 서버가 이 PC(loopback)에서만 열려 있는 로컬 실행에서만 LIVE가 열린다.
-  공개 배포(Streamlit Cloud 등)에서는 키가 있어도 열리지 않는다(`local_access`). 토큰이 없으면 어떤 LIVE 함수도 동작하지 않는다.
+- 접근 제한(비밀번호 없음): ① 이 PC(loopback)에서만 열린 로컬 실행(`local_access`) 또는 ② 플랫폼 로그인으로 확인된 열람자
+  (`viewer_access`, 앱을 '지정한 사람만 열람'으로 설정해야 함)에게만 LIVE가 열린다. 공개 익명 방문자에게는 키가 있어도 열리지 않는다.
+  토큰이 없으면 어떤 LIVE 함수도 동작하지 않는다.
 - OPENAI_API_KEY는 `LiveSettings`(repr 숨김)에만 있고 화면·상태 파일·오류 메시지에 쓰지 않는다.
 - 전송 입력은 합성 집계(`to_sanitized_monthly`)뿐이며 자유 입력·상담 원문은 스키마상 담을 수 없다.
 - 실행 장부(상태 파일)가 있으면 새 실행을 시작하지 않는다. 배타 잠금 파일이 있으면 어떤 호출도 하지 않는다.
@@ -104,6 +105,15 @@ def local_access(server_address: str | None, host_header: str | None, app_dir: s
     if _host_only(server_address) not in LOOPBACK_HOSTS or _host_only(host_header) not in LOOPBACK_HOSTS:
         return False
     return not str(app_dir).replace("\\", "/").startswith("/mount/")
+
+
+def viewer_access(email: object) -> bool:
+    """플랫폼(Streamlit Cloud)이 로그인으로 확인한 열람자만 통과시킨다.
+
+    비공개(지정한 사람만 열람) 앱에서는 로그인하지 않으면 앱에 접근할 수 없고, 로그인한 열람자의 이메일이 `st.user`에 채워진다.
+    공개 앱의 익명 방문자는 이메일이 없어 닫힌다. 이메일 값 자체는 저장·표시하지 않는다.
+    """
+    return isinstance(email, str) and 3 <= len(email) <= 254 and "@" in email and " " not in email
 
 
 class LocalGate:

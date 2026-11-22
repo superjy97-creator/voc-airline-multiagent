@@ -326,17 +326,17 @@ class LiveScreenTest(unittest.TestCase):
         self.addCleanup(st.cache_resource.clear)
         self.state = Path(folder.name) / "voc_live" / "live_web_state.json"
 
-    def app(self, *, key=True, local=False, live=True):
+    def app(self, *, key=True, local=False, live=True, viewer=False):
         """local=True면 로컬(loopback) 실행으로 판정되도록 접근 판정만 대체한다(그 판정 자체는 서비스 테스트가 검증)."""
         at = AppTest.from_file(str(ROOT / "app.py"), default_timeout=60)
-        if key:
-            at.secrets["OPENAI_API_KEY"] = KEY
-        patcher = patch("voc.live_service.local_access", return_value=local)
-        patcher.start()
-        self.addCleanup(patcher.stop)
+        at.secrets["OPENAI_API_KEY"] = KEY if key else ""      # 로컬 secrets.toml이 있어도 테스트는 그 값을 쓰지 않는다
+        for target, value in (("voc.live_service.local_access", local), ("voc.live_service.viewer_access", viewer)):
+            patcher = patch(target, return_value=value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
         at.run()
         if live:
-            next(r for r in at.sidebar.radio if r.label == "실행 모드").set_value("LIVE (로컬 전용)")
+            next(r for r in at.sidebar.radio if r.label == "실행 모드").set_value("LIVE (로그인 필요)")
             at.run()
         return at
 
@@ -371,6 +371,13 @@ class LiveScreenTest(unittest.TestCase):
         self.assertEqual([b.label for b in at.button if "LIVE 시작" in b.label], [])
         self.assertTrue(next(b for b in at.button if b.label == "분석 시작").disabled)
         self.assertEqual((self.fake.instances, self.state.exists()), ([], False))
+
+    def test_logged_in_viewer_opens_live_but_anonymous_does_not(self):
+        anonymous = self.app(local=False, viewer=False)
+        self.assertNotIn("실행 직전 승인 요청서", self.page(anonymous))
+        viewer = self.app(local=False, viewer=True)
+        self.assertIn("실행 직전 승인 요청서", self.page(viewer))
+        self.assertEqual(self.fake.instances, [])
 
     def test_local_without_api_key_is_disabled(self):
         at = self.app(key=False, local=True)

@@ -2,8 +2,8 @@
 
 실행: cd voc_consumer_analysis  →  streamlit run app.py
 - DRY_RUN(기본·공개): 가짜 모델(FakeRunner)만 사용한다. 외부 API 호출·상담 원문 사용 없음.
-- LIVE(합성 데이터 한정): 이 PC에서만 열린 로컬 실행(loopback)이고 OPENAI_API_KEY가 설정된 경우에만 열린다.
-  공개 배포에서는 열리지 않는다. 모든 접근 검사와 유료 호출 통제는 서버 측 voc.live_service가 수행한다.
+- LIVE(합성 데이터 한정): OPENAI_API_KEY가 있고, 로컬(loopback) 실행이거나 플랫폼 로그인으로 확인된 열람자일 때만 열린다.
+  공개 익명 접속에서는 열리지 않는다. 모든 접근 검사와 유료 호출 통제는 서버 측 voc.live_service가 수행한다.
 """
 
 import sys
@@ -363,9 +363,23 @@ def _host_header() -> str | None:
         return None
 
 
+def _viewer_email() -> str | None:
+    try:
+        value = st.user.get("email")
+        return value if isinstance(value, str) else None
+    except Exception:  # noqa: BLE001 - 로그인 정보가 없으면 열람자로 인정하지 않는다
+        return None
+
+
+def _live_allowed() -> bool:
+    """로컬(loopback) 실행이거나 플랫폼 로그인으로 확인된 열람자일 때만 LIVE 접근을 허용한다."""
+    return (live.local_access(st.get_option("server.address"), _host_header(), ROOT)
+            or live.viewer_access(_viewer_email()))
+
+
 def _local_gate() -> live.LocalGate:
-    """서버가 loopback에서만 열린 로컬 실행일 때만 토큰을 발급하는 게이트(공개 배포에서는 항상 닫힘)."""
-    return _gate_cache(live.local_access(st.get_option("server.address"), _host_header(), ROOT))
+    """허용된 환경에서만 토큰을 발급하는 게이트(공개 익명 방문자에게는 항상 닫힘)."""
+    return _gate_cache(_live_allowed())
 
 
 @st.cache_resource
@@ -389,10 +403,10 @@ def live_usage_table(view) -> None:
 
 def live_panel(stats, period: tuple[str, str], request_text: str, is_real: bool) -> None:
     """LIVE 영역. 인증·승인·중복 방지는 모두 voc.live_service가 서버 측에서 강제한다."""
-    st.markdown('<div class="sec">LIVE — 실제 API 실행(로컬 전용, 합성 데이터 한정)</div>', unsafe_allow_html=True)
-    if not live.local_access(st.get_option("server.address"), _host_header(), ROOT):
-        st.warning("LIVE는 이 PC에서 직접 실행한 로컬 화면에서만 열립니다. 공개 배포에서는 무단 유료 호출을 막기 위해 "
-                   "비활성입니다. DRY_RUN을 사용하세요.")
+    st.markdown('<div class="sec">LIVE — 실제 API 실행(로그인 필요, 합성 데이터 한정)</div>', unsafe_allow_html=True)
+    if not _live_allowed():
+        st.warning("LIVE는 로그인으로 확인된 열람자(앱을 ‘지정한 사람만 열람’으로 설정한 경우)이거나 이 PC에서 직접 실행한 "
+                   "로컬 화면에서만 열립니다. 무단 유료 호출을 막기 위해 공개 익명 접속에서는 비활성입니다. DRY_RUN을 사용하세요.")
         return
     try:
         settings = live.load_settings(_secret)
@@ -519,7 +533,7 @@ def live_record(view, settings, gate, store, token) -> None:
 
 def topbar(is_real: bool, live_mode: bool = False) -> None:
     """화이트 헤더: 왼쪽 네이비 제목, 오른쪽 상태 배지(실행 모드·데이터 구분·안전 표시)."""
-    mode_badge = ('<span class="badge real">LIVE 모드(로컬 전용)</span>' if live_mode
+    mode_badge = ('<span class="badge real">LIVE 모드(로그인 필요)</span>' if live_mode
                   else '<span class="badge mode">DRY_RUN 모드</span>')
     safe_badge = ('<span class="badge safe">합성 데이터만 · 승인 후 유료 호출</span>' if live_mode
                   else '<span class="badge safe">가짜 모델 · 외부 호출 0회</span>')
@@ -545,10 +559,10 @@ def main():
     st.sidebar.markdown('<div class="brand">VOC 에이전트 콘솔</div>'
                         '<div class="brand-sub">1372 항공여객운송서비스</div>', unsafe_allow_html=True)
     source = st.sidebar.radio("통계 출처", available_sources())
-    mode = st.sidebar.radio("실행 모드", ["DRY_RUN (공개 시연)", "LIVE (로컬 전용)"])
+    mode = st.sidebar.radio("실행 모드", ["DRY_RUN (공개 시연)", "LIVE (로그인 필요)"])
     live_mode = mode.startswith("LIVE")
     scenario = st.sidebar.selectbox("Reviewer 시나리오(DRY_RUN)", list(SCENARIOS), disabled=live_mode)
-    st.sidebar.caption("DRY_RUN은 가짜 모델만 쓰며 외부 호출이 없습니다. LIVE는 이 PC의 로컬 실행에서만 열리며 "
+    st.sidebar.caption("DRY_RUN은 가짜 모델만 쓰며 외부 호출이 없습니다. LIVE는 로그인된 열람자 또는 로컬 실행에서만 열리며 "
                        "합성 데이터로만 실행되며, 시작 전에 전송 범위·비용 승인이 필요합니다.")
     if len(available_sources()) == 1:
         st.sidebar.caption("로컬 집계 파일이 없어 합성 예시만 사용할 수 있습니다.")
