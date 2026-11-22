@@ -492,6 +492,8 @@ def live_record(view, settings, gate, store, token, limiter, run_id) -> None:
         st.warning("사용자가 반려했습니다.")
     elif step.stop_reason is not None:
         st.error(f"중단: {ERROR_MESSAGES[step.stop_reason]}")
+        for line in view.errors:                      # 키 형태는 가려진 진단 요약(오류 종류·HTTP 코드)만 보여 준다
+            st.caption(f"진단: {line}")
     elif step.stage is StageName.HUMAN_REVIEW:
         st.subheader("Human Review")
         review = latest_output(result, StageName.REVIEWER, StageName.REVIEWER_RECHECK)
