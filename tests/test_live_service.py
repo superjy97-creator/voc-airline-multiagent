@@ -202,6 +202,20 @@ class LiveServiceTest(unittest.TestCase):
         self.assertEqual(svc.INPUT_CAP_CHARS, 10_000)
         self.assertLessEqual(self.plan.worst, svc.DEFAULT_COST_CAP)
 
+    def test_long_revision_path_reaches_manager_within_input_cap(self):
+        """두 번째 실제 실행의 회귀: 수정 요청 뒤 재검수·Manager 입력도 상한 안에 들어야 한다(최신 산출물만 전송)."""
+        with patch.object(svc, "SdkRunner", LongOutputSdk):
+            self.start()
+            self.go(HumanDecision.REQUEST_REVISION)
+            view = self.view()
+            self.assertIsNone(next_step(view.result).stop_reason)
+            self.go(HumanDecision.APPROVE_AS_IS)
+        final = self.view()
+        self.assertIs(next_step(final.result).stage, StageName.FINAL_APPROVAL)
+        self.assertIn(StageName.REVIEWER_RECHECK, FakeSdk.calls)
+        self.assertEqual(FakeSdk.calls[-1], StageName.MANAGER)
+        self.assertLessEqual(len(FakeSdk.calls), 9)
+
     def test_revision_path_stays_within_nine_calls(self):
         self.start()
         self.go(HumanDecision.REQUEST_REVISION, "근거를 보강해 주세요.")

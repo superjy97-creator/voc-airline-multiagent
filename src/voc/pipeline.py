@@ -56,6 +56,24 @@ def new_run(
     )
 
 
+def _select_priors(stage: StageName, previous: dict[StageName, str]) -> dict[StageName, str]:
+    """단계가 실제로 필요한 이전 산출물만 고른다(입력 글자 상한·비용 절약, 불필요한 전송 최소화).
+
+    재검수는 수정본과 직전 검수 지시만, Manager는 최신 보고서와 최신 검수 결과만 받는다.
+    첫 실제 실행에서 모든 산출물을 누적해 보내면 재검수·Manager 입력이 상한을 넘어 차단됐다.
+    """
+    if stage is StageName.REVIEWER_RECHECK:
+        wanted = (StageName.WRITER_REVISION, StageName.REVIEWER)
+    elif stage is StageName.MANAGER:
+        wanted = tuple(name for name in (
+            StageName.WRITER_REVISION if StageName.WRITER_REVISION in previous else StageName.WRITER_DRAFT,
+            StageName.REVIEWER_RECHECK if StageName.REVIEWER_RECHECK in previous else StageName.REVIEWER,
+        ))
+    else:
+        return previous
+    return {name: previous[name] for name in wanted if name in previous}
+
+
 def _model_input(
     result: PipelineResult, ctx: RunContext, stage: StageName, round_no: int,
 ) -> StageInput:
@@ -79,6 +97,7 @@ def _model_input(
             notes = ctx.to_checked(entry.output_text)   # 자유 메모는 수정 지시를 받는 Writer(수정)에게만 전달
 
     version = round_no + 1 if stage in WRITER_STAGES else latest_version
+    previous = _select_priors(stage, previous)
     return StageInput(
         stage, round_no, version, ctx.sanitized,
         tuple((name, ctx.to_checked(output)) for name, output in previous.items()), notes,
