@@ -1,4 +1,4 @@
-# Streamlit 화면 실행에 필요한 패키지(DRY_RUN은 아래 두 개만 사용, LIVE는 openai-agents도 사용)
+# Streamlit 화면 실행에 필요한 패키지(DRY_RUN은 streamlit·pandas만 사용, LIVE는 openai-agents도 사용) — 변경 시 앱이 재시작된다
 streamlit>=1.50
 pandas>=2.2,<4
 openai-agents==0.25.0
