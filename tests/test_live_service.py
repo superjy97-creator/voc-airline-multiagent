@@ -70,7 +70,7 @@ class LiveServiceTest(unittest.TestCase):
         self.addCleanup(patcher.stop)
         self.store = svc.LiveStore(Path(folder.name))
         self.settings = svc.LiveSettings(KEY)
-        self.gate = svc.LocalGate(True)
+        self.gate = svc.SessionGate()
         self.token = self.gate.issue()
         self.stats = synthetic_trend_stats()
         self.plan = svc.build_plan(self.stats, PERIOD, REQUEST, (0.10, 0.50))
@@ -92,7 +92,7 @@ class LiveServiceTest(unittest.TestCase):
                          self.view().stage_count if count is None else count, HumanInput(decision, notes),
                          client_factory)
 
-    # ---- 설정·로컬 접근 제한 ----
+    # ---- 설정·세션 토큰 ----
     def test_settings_need_only_the_key_and_reject_cheap_prices(self):
         values = {"OPENAI_API_KEY": KEY}
         self.assertIsNone(svc.load_settings({}.get))
@@ -107,36 +107,9 @@ class LiveServiceTest(unittest.TestCase):
         assert priced is not None
         self.assertEqual(priced.price_in, 0.2)
 
-    def test_local_access_only_for_loopback_server_host_and_non_cloud_path(self):
-        ok = ("localhost", "localhost:8501", r"C:\lab3\voc_consumer_analysis")
-        self.assertTrue(svc.local_access(*ok))
-        self.assertTrue(svc.local_access("127.0.0.1", "127.0.0.1:8501", "/home/me/app"))
-        self.assertTrue(svc.local_access("::1", "[::1]:8501", "/home/me/app"))
-        for address, host, path in (
-            (None, "localhost:8501", "/home/me/app"),                        # 바인딩 주소를 알 수 없음
-            ("0.0.0.0", "localhost:8501", "/home/me/app"),                   # 모든 인터페이스에 열린 서버
-            ("localhost", "voc-airline-ai.streamlit.app", "/home/me/app"),   # 공개 도메인으로 접속
-            ("localhost", None, "/home/me/app"),                             # Host를 알 수 없음
-            ("localhost", "evil.com", "/home/me/app"),
-            ("localhost", "localhost:8501", "/mount/src/voc-airline-multiagent"),   # Streamlit Cloud 경로
-        ):
-            with self.subTest(address=address, host=host, path=path):
-                self.assertFalse(svc.local_access(address, host, path))
-
-    def test_viewer_access_requires_a_platform_verified_email(self):
-        self.assertTrue(svc.viewer_access("someone@example.com"))
-        for bad in (None, "", "   ", "no-at-sign", "a b@c.com", 123, "x" * 300):
-            with self.subTest(email=bad):
-                self.assertFalse(svc.viewer_access(bad))
-
-    def test_gate_issues_tokens_only_when_allowed_and_expires(self):
-        closed = svc.LocalGate(False)
-        self.assertIsNone(closed.issue())
-        self.assertFalse(closed.valid("forged"))
-        with self.assertRaises(svc.LiveError):
-            closed.require("forged")
+    def test_gate_tokens_are_server_issued_and_expire(self):
         now = [0.0]
-        gate = svc.LocalGate(True, session_seconds=100, clock=lambda: now[0])
+        gate = svc.SessionGate(session_seconds=100, clock=lambda: now[0])
         token = gate.issue()
         self.assertTrue(gate.valid(token))
         self.assertFalse(gate.valid("forged-token"))
@@ -303,6 +276,132 @@ class LiveServiceTest(unittest.TestCase):
             self.go(HumanDecision.REQUEST_REVISION, "전화 010-1234-5678")
         self.assertEqual(len(FakeSdk.calls), calls)
         self.assertFalse(self.store.lock_path.exists())       # 잠금도 풀린다
+
+
+class LimiterTest(unittest.TestCase):
+    """공개 이용 한도: 세션·사용자를 바꿔도 전체 한도를 넘을 수 없고, 남용 시 자동 차단된다."""
+
+    def setUp(self):
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        self.dir = Path(folder.name)
+        self.now = [1000.0]
+
+    def make(self, **limits):
+        return svc.PublicLimiter(self.dir, svc.PublicLimits(**limits), clock=lambda: self.now[0])
+
+    def test_one_active_run_at_a_time_then_free_after_finish(self):
+        limiter = self.make()
+        first = limiter.admit("a", 0.05)
+        with self.assertRaises(svc.LiveError) as raised:
+            limiter.admit("b", 0.05)
+        self.assertIn("진행 중", str(raised.exception))
+        limiter.finish(first, 0.004)
+        self.assertTrue(limiter.admit("b", 0.05))
+
+    def test_finish_settles_actual_cost_once_and_refunds_the_reservation(self):
+        limiter = self.make(max_total_cost_usd=0.10)
+        run = limiter.admit("a", 0.05)
+        self.assertAlmostEqual(limiter.status()["budget_left"], 0.05)
+        limiter.finish(run, 0.004)
+        limiter.finish(run, 0.05)                       # 같은 실행의 두 번째 정산은 무시된다
+        self.assertAlmostEqual(limiter.status()["budget_left"], 0.096)
+
+    def test_expired_run_frees_the_slot_but_keeps_the_reserved_cost(self):
+        limiter = self.make(active_ttl_s=60, max_total_cost_usd=0.10)
+        limiter.admit("a", 0.05)
+        self.now[0] += 61
+        self.assertTrue(limiter.admit("b", 0.04))
+        with self.assertRaises(svc.LiveError):
+            self.now[0] += 61
+            limiter.admit("c", 0.05)                    # 예약 합계 0.09 + 0.05 > 0.10
+
+    def test_total_run_and_cost_caps_apply_across_clients(self):
+        limiter = self.make(max_runs_total=2, max_active_runs=5)
+        for client in ("a", "b"):
+            limiter.admit(client, 0.01)
+        with self.assertRaises(svc.LiveError) as raised:
+            limiter.admit("c", 0.01)
+        self.assertIn("전체 실행 한도", str(raised.exception))
+        cost_dir = self.dir / "cost"
+        cost = svc.PublicLimiter(cost_dir, svc.PublicLimits(max_runs_total=99, max_active_runs=99,
+                                                            max_total_cost_usd=0.03), clock=lambda: self.now[0])
+        cost.admit("a", 0.02)
+        with self.assertRaises(svc.LiveError) as raised:
+            cost.admit("b", 0.02)
+        self.assertIn("전체 비용 한도", str(raised.exception))
+
+    def test_per_client_cap_within_window(self):
+        limiter = self.make(max_active_runs=9, per_client_runs=2, per_client_window_s=100)
+        for _ in range(2):
+            limiter.finish(limiter.admit("same", 0.01), 0.0)
+        with self.assertRaises(svc.LiveError):
+            limiter.admit("same", 0.01)
+        self.assertTrue(limiter.admit("other", 0.01))
+        self.now[0] += 101
+        self.assertTrue(limiter.admit("same", 0.01))
+
+    def test_repeated_failures_trip_an_automatic_block_that_expires(self):
+        limiter = self.make(failure_trip=2, block_seconds=100, max_active_runs=9, per_client_runs=99)
+        for _ in range(2):
+            limiter.fail(limiter.admit("a", 0.01), None)
+        self.assertTrue(limiter.status()["blocked"])
+        with self.assertRaises(svc.LiveError) as raised:
+            limiter.admit("b", 0.01)
+        self.assertIn("일시 차단", str(raised.exception))
+        self.now[0] += 101
+        self.assertFalse(limiter.status()["blocked"])
+        self.assertTrue(limiter.admit("b", 0.01))
+
+    def test_many_rejections_trip_an_automatic_block(self):
+        limiter = self.make(reject_trip=5, block_seconds=100)
+        for _ in range(5):
+            limiter.reject()
+        self.assertTrue(limiter.status()["blocked"])
+        with self.assertRaises(svc.LiveError):
+            limiter.admit("a", 0.01)
+
+    def test_concurrent_sessions_cannot_exceed_the_global_limits(self):
+        import threading
+        limiter = self.make(max_active_runs=1)
+        wins, errors = [], []
+
+        def attempt(i):
+            try:
+                wins.append(limiter.admit(f"c{i}", 0.01))
+            except svc.LiveError as error:
+                errors.append(error)
+
+        threads = [threading.Thread(target=attempt, args=(i,)) for i in range(12)]
+        [t.start() for t in threads]
+        [t.join() for t in threads]
+        self.assertEqual((len(wins), len(errors)), (1, 11))
+        wide = svc.PublicLimiter(self.dir / "wide", svc.PublicLimits(max_active_runs=99, per_client_runs=99,
+                                                                    max_runs_total=3, max_total_cost_usd=0.5),
+                                 clock=lambda: self.now[0])
+        results = []
+
+        def safe(i):
+            try:
+                results.append(wide.admit(f"x{i}", 0.01))
+            except svc.LiveError:
+                pass
+
+        threads = [threading.Thread(target=safe, args=(i,)) for i in range(12)]
+        [t.start() for t in threads]
+        [t.join() for t in threads]
+        self.assertEqual(len(results), 3)               # 전체 실행 한도 3을 넘지 못한다
+
+    def test_run_ids_are_validated_and_must_be_known(self):
+        limiter = self.make()
+        run = limiter.admit("a", 0.01)
+        self.assertTrue(limiter.known(run))
+        for bad in (None, "", "../etc/passwd", "short", "x" * 40, 123):
+            with self.subTest(run_id=bad):
+                self.assertFalse(limiter.known(bad))
+        self.assertTrue(svc.run_dir(run, self.dir).is_relative_to(self.dir))
+        with self.assertRaises(svc.LiveError):
+            svc.run_dir("../escape", self.dir)
 
 
 if __name__ == "__main__":

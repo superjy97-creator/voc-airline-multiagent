@@ -1,18 +1,19 @@
-"""웹 LIVE 서비스(합성 데이터 전용): 관리자 인증·승인 코드·1회 실행 장부·중복 호출 방지.
+"""웹 LIVE 서비스(합성 데이터 전용): 공개 이용 한도·승인 코드·실행별 장부·중복 호출 방지.
 
-원칙(모두 서버 측에서 강제):
-- 접근 제한(비밀번호 없음): ① 이 PC(loopback)에서만 열린 로컬 실행(`local_access`) 또는 ② 플랫폼 로그인으로 확인된 열람자
-  (`viewer_access`, 앱을 '지정한 사람만 열람'으로 설정해야 함)에게만 LIVE가 열린다. 공개 익명 방문자에게는 키가 있어도 열리지 않는다.
-  토큰이 없으면 어떤 LIVE 함수도 동작하지 않는다.
+공개(로그인 없음) 서비스이므로 한도는 모두 서버 측에서 강제한다.
+- 전체 한도(`PublicLimiter`): 동시 실행 수, 전체 실행 수, 전체 비용(실행 시작 시 최악 비용을 예약), 사용자(접속 주소)별 실행 수,
+  남용 감지 시 자동 차단. 모든 세션이 같은 서버 프로세스·같은 장부 파일을 쓰므로 세션을 바꿔도 우회할 수 없다.
+- 실행별 한도: 호출 9회·비용 $0.05·입력 10,000자·재시도 0회. 기록이 있으면 같은 실행은 다시 시작하지 않는다.
 - OPENAI_API_KEY는 `LiveSettings`(repr 숨김)에만 있고 화면·상태 파일·오류 메시지에 쓰지 않는다.
 - 전송 입력은 합성 집계(`to_sanitized_monthly`)뿐이며 자유 입력·상담 원문은 스키마상 담을 수 없다.
-- 실행 장부(상태 파일)가 있으면 새 실행을 시작하지 않는다. 배타 잠금 파일이 있으면 어떤 호출도 하지 않는다.
 - 호출 직전에 '진행 중' 표시를 먼저 저장해, 도중에 끊겨도 같은 호출이 다시 나가지 않는다(fail-closed).
+한계: 서버 장부는 재시작하면 초기화되므로(Cloud 파일시스템은 임시) 재시작을 넘는 지출 상한은 OpenAI 프로젝트의 지출 한도로 보장해야 한다.
 """
 
 import hashlib
 import json
 import os
+import re
 import secrets
 import tempfile
 import threading
@@ -59,7 +60,6 @@ OPENAI_URL = "https://api.openai.com/v1"
 PRICE_FLOOR = (0.10, 0.50)      # 사용자가 승인한 100만 토큰당 단가(입력, 출력). 이보다 낮은 설정은 거부한다.
 MAX_OUTPUT_TOKENS = 2500
 INPUT_CAP_CHARS = 10_000   # 호출당 입력 글자 상한. 첫 실제 실행에서 4,000자는 Reviewer 입력(약 6,450자)보다 작아 차단됐다.
-LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
 STATE_NAME, LOCK_NAME = "live_web_state.json", "live_web.lock"
 
 
@@ -89,45 +89,15 @@ def load_settings(get: Callable[[str], object]) -> LiveSettings | None:
     return LiveSettings(key, price_in, price_out)
 
 
-def _host_only(value: str | None) -> str:
-    text = (value or "").strip().lower()
-    if text.startswith("["):                      # [::1]:8501
-        return text[1:text.find("]")] if "]" in text else text
-    return text.rsplit(":", 1)[0] if text.count(":") == 1 else text
+class SessionGate:
+    """세션 토큰 발급기. 모든 LIVE 함수는 이 토큰이 유효해야만 동작한다(서버가 발급한 토큰만 유효)."""
 
-
-def local_access(server_address: str | None, host_header: str | None, app_dir: str | Path) -> bool:
-    """이 PC에서만 열린 로컬 실행인지 서버 측 사실로 판정한다(공개 배포는 항상 False).
-
-    세 조건을 모두 만족해야 한다: ① 서버 바인딩 주소가 loopback ② 요청 Host가 loopback
-    ③ 앱이 Streamlit Cloud 경로(/mount/)가 아닌 곳에서 실행. 하나라도 어긋나면 LIVE는 열리지 않는다.
-    """
-    if _host_only(server_address) not in LOOPBACK_HOSTS or _host_only(host_header) not in LOOPBACK_HOSTS:
-        return False
-    return not str(app_dir).replace("\\", "/").startswith("/mount/")
-
-
-def viewer_access(email: object) -> bool:
-    """플랫폼(Streamlit Cloud)이 로그인으로 확인한 열람자만 통과시킨다.
-
-    비공개(지정한 사람만 열람) 앱에서는 로그인하지 않으면 앱에 접근할 수 없고, 로그인한 열람자의 이메일이 `st.user`에 채워진다.
-    공개 앱의 익명 방문자는 이메일이 없어 닫힌다. 이메일 값 자체는 저장·표시하지 않는다.
-    """
-    return isinstance(email, str) and 3 <= len(email) <= 254 and "@" in email and " " not in email
-
-
-class LocalGate:
-    """로컬 접근 토큰 발급기. 허용되지 않은 환경에서는 토큰을 발급하지 않는다."""
-
-    def __init__(self, allowed: bool, *, session_seconds: float = 3600,
-                 clock: Callable[[], float] = time.monotonic) -> None:
-        self._allowed, self._session, self._clock = bool(allowed), session_seconds, clock
+    def __init__(self, *, session_seconds: float = 3600, clock: Callable[[], float] = time.monotonic) -> None:
+        self._session, self._clock = session_seconds, clock
         self._tokens: dict[str, float] = {}
         self._mutex = threading.Lock()
 
-    def issue(self) -> str | None:
-        if not self._allowed:
-            return None
+    def issue(self) -> str:
         with self._mutex:
             token = secrets.token_urlsafe(32)
             self._tokens[token] = self._clock() + self._session
@@ -137,7 +107,7 @@ class LocalGate:
         with self._mutex:
             now = self._clock()
             self._tokens = {t: e for t, e in self._tokens.items() if e > now}
-            return self._allowed and isinstance(token, str) and token in self._tokens
+            return isinstance(token, str) and token in self._tokens
 
     def logout(self, token: object) -> None:
         with self._mutex:
@@ -146,7 +116,7 @@ class LocalGate:
 
     def require(self, token: object) -> None:
         if not self.valid(token):
-            raise LiveError("이 환경에서는 LIVE를 실행할 수 없습니다(로컬 실행에서만 허용).")
+            raise LiveError("유효한 세션이 아닙니다. 새로고침 후 다시 시도하세요.")
 
 
 def default_store_dir() -> Path:
@@ -178,6 +148,166 @@ class LiveStore:
 
     def read(self) -> dict | None:
         return json.loads(self.state_path.read_text(encoding="utf-8")) if self.exists() else None
+
+
+# ---- 공개 이용 한도(전체·사용자별·남용 차단) ----------------------------------
+
+RUN_ID_PATTERN = re.compile(r"[A-Za-z0-9_-]{12,32}")
+
+
+@dataclass(frozen=True)
+class PublicLimits:
+    max_active_runs: int = 1            # 동시에 진행할 수 있는 실행 수(전체)
+    max_runs_total: int = 10            # 서버 프로세스 수명 동안 시작할 수 있는 전체 실행 수
+    max_total_cost_usd: float = 0.50    # 전체 비용 한도: 시작 시 실행당 최악 비용을 예약하고, 끝나면 실제 사용량으로 정산
+    per_client_runs: int = 3            # 접속 주소별 실행 수(창 안)
+    per_client_window_s: float = 86400
+    active_ttl_s: float = 1800          # 이 시간 동안 진행이 없으면 실행을 만료(예약 비용은 유지)
+    reject_trip: int = 30               # 창 안에 거부가 이만큼 쌓이면 자동 차단
+    reject_window_s: float = 600
+    failure_trip: int = 3               # API 실패·중단 실행이 이만큼이면 자동 차단
+    block_seconds: float = 3600
+
+
+class PublicLimiter:
+    """모든 세션이 공유하는 서버 측 이용 한도. 장부 파일을 잠금으로 보호해 동시 접속에서도 한도를 넘지 못한다."""
+
+    def __init__(self, directory: Path | None = None, limits: PublicLimits | None = None,
+                 clock: Callable[[], float] = time.time) -> None:
+        self.directory = Path(directory) if directory else default_store_dir()
+        self.limits = limits or PublicLimits()
+        self.clock = clock
+        self.path = self.directory / "public_ledger.json"
+        self.lock_path = self.directory / "public_ledger.lock"
+
+    @contextmanager
+    def _locked(self):
+        self.directory.mkdir(parents=True, exist_ok=True)
+        deadline = time.monotonic() + 5
+        while True:
+            try:
+                fd = os.open(self.lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                break
+            except FileExistsError:
+                try:      # 아주 짧게만 잡는 잠금이므로, 오래 남은 잠금은 비정상 종료의 잔재로 보고 치운다
+                    if time.time() - self.lock_path.stat().st_mtime > 30:
+                        self.lock_path.unlink(missing_ok=True)
+                        continue
+                except OSError:
+                    continue
+                if time.monotonic() > deadline:
+                    raise LiveError("요청이 몰려 잠시 처리할 수 없습니다. 잠시 후 다시 시도하세요.") from None
+                time.sleep(0.02)
+        try:
+            yield
+        finally:
+            os.close(fd)
+            self.lock_path.unlink(missing_ok=True)
+
+    def _load(self) -> dict:
+        if self.path.exists():
+            return json.loads(self.path.read_text(encoding="utf-8"))
+        return {"runs": [], "rejects": [], "failures": 0, "blocked_until": 0.0, "blocked_reason": None}
+
+    def _save(self, state: dict) -> None:
+        self.path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    @staticmethod
+    def _total_cost(state: dict) -> float:
+        return sum(r["cost"] for r in state["runs"])
+
+    def _block(self, state: dict, reason: str, now: float) -> None:
+        state["blocked_until"], state["blocked_reason"] = now + self.limits.block_seconds, reason
+
+    def _reject(self, state: dict, now: float) -> None:
+        window = now - self.limits.reject_window_s
+        state["rejects"] = [t for t in state["rejects"] if t > window] + [now]
+        if len(state["rejects"]) >= self.limits.reject_trip:
+            self._block(state, "거부된 요청이 짧은 시간에 너무 많아 남용으로 판단", now)
+            state["rejects"] = []
+
+    def reject(self) -> None:
+        """승인 코드 불일치 등 거부된 요청을 기록한다(많이 쌓이면 자동 차단)."""
+        with self._locked():
+            state = self._load()
+            self._reject(state, self.clock())
+            self._save(state)
+
+    def admit(self, client: str, worst_cost: float) -> str:
+        """실행 시작을 허가하고 최악 비용을 예약한다. 한도를 넘으면 LiveError(호출 없음)."""
+        lim = self.limits
+        with self._locked():
+            state, now = self._load(), self.clock()
+            for run in state["runs"]:
+                if run["state"] == "active" and now - run["started"] > lim.active_ttl_s:
+                    run["state"] = "expired"          # 진행이 멈춘 실행: 자리는 비우되 예약 비용은 유지한다
+            reason = None
+            recent = [r for r in state["runs"] if r["client"] == client and now - r["started"] < lim.per_client_window_s]
+            if now < state["blocked_until"]:
+                self._save(state)
+                raise LiveError("남용 방지를 위해 LIVE가 일시 차단되었습니다. 잠시 후 다시 시도하세요(DRY_RUN은 계속 사용할 수 있습니다).")
+            if sum(1 for r in state["runs"] if r["state"] == "active") >= lim.max_active_runs:
+                reason = "다른 사용자가 LIVE를 진행 중입니다. 끝난 뒤 다시 시도하세요."
+            elif len(state["runs"]) >= lim.max_runs_total:
+                reason = "LIVE 전체 실행 한도에 도달했습니다. DRY_RUN을 사용하세요."
+            elif self._total_cost(state) + worst_cost > lim.max_total_cost_usd:
+                reason = "LIVE 전체 비용 한도에 도달했습니다. DRY_RUN을 사용하세요."
+            elif len(recent) >= lim.per_client_runs:
+                reason = "이 접속 주소의 LIVE 이용 한도에 도달했습니다."
+            if reason:
+                self._reject(state, now)
+                self._save(state)
+                raise LiveError(reason)
+            run_id = secrets.token_urlsafe(12)
+            state["runs"].append({"id": run_id, "client": client, "started": now, "state": "active",
+                                  "cost": worst_cost, "settled": False})
+            self._save(state)
+            return run_id
+
+    def known(self, run_id: object) -> bool:
+        if not isinstance(run_id, str) or not RUN_ID_PATTERN.fullmatch(run_id):
+            return False
+        with self._locked():
+            return any(r["id"] == run_id for r in self._load()["runs"])
+
+    def _settle(self, run_id: str, actual_cost: float | None, failed: bool) -> None:
+        with self._locked():
+            state, now = self._load(), self.clock()
+            run = next((r for r in state["runs"] if r["id"] == run_id), None)
+            if run is None or run["settled"]:
+                return
+            run["settled"], run["state"] = True, "done"
+            if actual_cost is not None:        # 알 수 없는 비용(끊김)은 예약한 최악 비용을 그대로 둔다
+                run["cost"] = max(float(actual_cost), 0.0)
+            if failed:
+                state["failures"] += 1
+                if state["failures"] >= self.limits.failure_trip:
+                    self._block(state, "API 실패·중단이 반복되어 자동 차단", now)
+                    state["failures"] = 0
+            self._save(state)
+
+    def finish(self, run_id: str, actual_cost: float | None) -> None:
+        """정상 종료(최종 승인·반려)를 실제 사용량으로 정산한다. 같은 실행은 한 번만 정산된다."""
+        self._settle(run_id, actual_cost, failed=False)
+
+    def fail(self, run_id: str, actual_cost: float | None) -> None:
+        """실패·중단된 실행을 정산하고 실패 횟수를 센다(반복되면 LIVE 자동 차단)."""
+        self._settle(run_id, actual_cost, failed=True)
+
+    def status(self) -> dict:
+        with self._locked():
+            state, now = self._load(), self.clock()
+            lim = self.limits
+            active = sum(1 for r in state["runs"] if r["state"] == "active" and now - r["started"] <= lim.active_ttl_s)
+            return {"blocked": now < state["blocked_until"], "reason": state["blocked_reason"],
+                    "active": active, "runs_left": max(lim.max_runs_total - len(state["runs"]), 0),
+                    "budget_left": max(lim.max_total_cost_usd - self._total_cost(state), 0.0)}
+
+
+def run_dir(run_id: str, base: Path | None = None) -> Path:
+    if not RUN_ID_PATTERN.fullmatch(run_id):
+        raise LiveError("실행 번호 형식이 올바르지 않습니다.")
+    return (Path(base) if base else default_store_dir()) / "runs" / run_id
 
 
 # ---- 승인 요청서 -------------------------------------------------------------
@@ -293,7 +423,7 @@ def _make_context(settings: LiveSettings, stats, meta: dict, budget: CallBudget,
     return ctx, logging, est, prices
 
 
-def start_run(store: LiveStore, gate: LocalGate, token: object, settings: LiveSettings, stats,
+def start_run(store: LiveStore, gate: SessionGate, token: object, settings: LiveSettings, stats,
               period: tuple[str, str], request: str, typed_code: str,
               client_factory: Callable = default_client) -> None:
     gate.require(token)
@@ -340,7 +470,7 @@ class LiveView:
     stage_count: int
 
 
-def load_view(store: LiveStore, gate: LocalGate, token: object) -> LiveView | None:
+def load_view(store: LiveStore, gate: SessionGate, token: object) -> LiveView | None:
     gate.require(token)
     data = store.read()
     if data is None:
@@ -354,7 +484,7 @@ def load_view(store: LiveStore, gate: LocalGate, token: object) -> LiveView | No
     return LiveView(result, usage, errors, data["meta"], bool(data.get("inflight")), spent, len(result.stages))
 
 
-def continue_run(store: LiveStore, gate: LocalGate, token: object, settings: LiveSettings,
+def continue_run(store: LiveStore, gate: SessionGate, token: object, settings: LiveSettings,
                  expected_stage_count: int, human: HumanInput,
                  client_factory: Callable = default_client) -> None:
     """Human Review 결정을 반영해 이어서 실행한다. 화면이 오래된 요청(새로고침·중복 클릭)은 호출 없이 거부한다."""
@@ -379,7 +509,7 @@ def continue_run(store: LiveStore, gate: LocalGate, token: object, settings: Liv
         _advance_and_save(store, result, ctx, logging, budget, errors, human, meta)
 
 
-def finalize(store: LiveStore, gate: LocalGate, token: object, approve: bool) -> None:
+def finalize(store: LiveStore, gate: SessionGate, token: object, approve: bool) -> None:
     """최종 승인/반려(호출 없음). 사용자의 결정만 기록한다."""
     gate.require(token)
     with store.locked():

@@ -2,10 +2,11 @@
 
 실행: cd voc_consumer_analysis  →  streamlit run app.py
 - DRY_RUN(기본·공개): 가짜 모델(FakeRunner)만 사용한다. 외부 API 호출·상담 원문 사용 없음.
-- LIVE(합성 데이터 한정): OPENAI_API_KEY가 있고, 로컬(loopback) 실행이거나 플랫폼 로그인으로 확인된 열람자일 때만 열린다.
-  공개 익명 접속에서는 열리지 않는다. 모든 접근 검사와 유료 호출 통제는 서버 측 voc.live_service가 수행한다.
+- LIVE(합성 데이터 한정): OPENAI_API_KEY가 설정돼 있으면 로그인 없이 열리지만, 서버 측 voc.live_service가 전체 실행·예산 한도,
+  한 번에 1명 실행, 접속 주소별 한도, 남용 자동 차단, 실행당 9회·$0.05를 강제한다.
 """
 
+import hashlib
 import sys
 from html import escape
 from pathlib import Path
@@ -356,40 +357,33 @@ def _secret(name: str):
         return None
 
 
-def _host_header() -> str | None:
+def _client_key() -> str:
+    """접속 주소별 한도용 식별자(원문 주소는 저장하지 않고 해시만 쓴다). 전체 한도가 실제 보장 장치다."""
     try:
-        return st.context.headers.get("Host")
-    except Exception:  # noqa: BLE001 - 헤더를 읽을 수 없으면 로컬로 인정하지 않는다
-        return None
-
-
-def _viewer_email() -> str | None:
-    try:
-        value = st.user.get("email")
-        return value if isinstance(value, str) else None
-    except Exception:  # noqa: BLE001 - 로그인 정보가 없으면 열람자로 인정하지 않는다
-        return None
-
-
-def _live_allowed() -> bool:
-    """로컬(loopback) 실행이거나 플랫폼 로그인으로 확인된 열람자일 때만 LIVE 접근을 허용한다."""
-    return (live.local_access(st.get_option("server.address"), _host_header(), ROOT)
-            or live.viewer_access(_viewer_email()))
-
-
-def _local_gate() -> live.LocalGate:
-    """허용된 환경에서만 토큰을 발급하는 게이트(공개 익명 방문자에게는 항상 닫힘)."""
-    return _gate_cache(_live_allowed())
+        address = st.context.ip_address
+    except Exception:  # noqa: BLE001
+        address = None
+    return hashlib.sha256(str(address or "unknown").encode("utf-8")).hexdigest()[:16]
 
 
 @st.cache_resource
-def _gate_cache(allowed: bool) -> live.LocalGate:
-    return live.LocalGate(allowed)
+def _live_gate() -> live.SessionGate:
+    return live.SessionGate()
 
 
 @st.cache_resource
-def _live_store() -> live.LiveStore:
-    return live.LiveStore()
+def _limiter() -> live.PublicLimiter:
+    return live.PublicLimiter()
+
+
+def _settle(limiter: live.PublicLimiter, run_id: str, view) -> None:
+    """끝났거나 멈춘 실행을 전체 한도 장부에 정산한다(같은 실행은 한 번만 반영)."""
+    result = view.result
+    stopped = view.interrupted or next_step(result).stop_reason is not None
+    if stopped:
+        limiter.fail(run_id, None if view.interrupted else view.spent)
+    elif result.approval is not ApprovalStatus.DRAFT:
+        limiter.finish(run_id, view.spent)
 
 
 def live_usage_table(view) -> None:
@@ -402,12 +396,8 @@ def live_usage_table(view) -> None:
 
 
 def live_panel(stats, period: tuple[str, str], request_text: str, is_real: bool) -> None:
-    """LIVE 영역. 인증·승인·중복 방지는 모두 voc.live_service가 서버 측에서 강제한다."""
-    st.markdown('<div class="sec">LIVE — 실제 API 실행(로그인 필요, 합성 데이터 한정)</div>', unsafe_allow_html=True)
-    if not _live_allowed():
-        st.warning("LIVE는 로그인으로 확인된 열람자(앱을 ‘지정한 사람만 열람’으로 설정한 경우)이거나 이 PC에서 직접 실행한 "
-                   "로컬 화면에서만 열립니다. 무단 유료 호출을 막기 위해 공개 익명 접속에서는 비활성입니다. DRY_RUN을 사용하세요.")
-        return
+    """LIVE 영역(로그인 없음). 전체 한도·중복 방지·승인은 모두 서버 측 voc.live_service가 강제한다."""
+    st.markdown('<div class="sec">LIVE — 실제 API 실행(합성 데이터 한정)</div>', unsafe_allow_html=True)
     try:
         settings = live.load_settings(_secret)
     except live.LiveError as error:
@@ -416,29 +406,31 @@ def live_panel(stats, period: tuple[str, str], request_text: str, is_real: bool)
     if settings is None:
         st.info("LIVE는 서버 설정(OPENAI_API_KEY)이 없어 비활성입니다.")
         return
-    gate, store = _local_gate(), _live_store()
+    gate, limiter = _live_gate(), _limiter()
     token = st.session_state.get("live_token")
     if not gate.valid(token):
         token = gate.issue()
-        if token is None:
-            st.warning("이 환경에서는 LIVE 접근 토큰을 발급할 수 없습니다.")
-            return
         st.session_state.live_token = token
     if is_real:
         st.error("실제 집계 자료의 LIVE는 이용 조건 확인과 별도 승인 전까지 비활성입니다. 합성 자료를 선택하세요.")
         return
-    try:
-        view = live.load_view(store, gate, token)
-    except live.LiveError as error:
-        st.error(str(error))
+    status = limiter.status()
+    st.caption(f"공개 이용 한도: 남은 전체 실행 {status['runs_left']}회 · 남은 전체 예산 ${status['budget_left']:.2f} · "
+               f"진행 중 {status['active']}건 · 한 번에 1명만 실행 · 실행당 호출 9회·$0.05")
+    if status["blocked"]:
+        st.error(f"LIVE가 일시 차단되었습니다({status['reason']}). 잠시 후 다시 시도하거나 DRY_RUN을 사용하세요.")
+    run_id = st.query_params.get("run")
+    if not (run_id and limiter.known(run_id)):
+        run_id = None
+    store = live.LiveStore(live.run_dir(run_id)) if run_id else None
+    view = live.load_view(store, gate, token) if store else None
+    if view is None or run_id is None or store is None:
+        live_start_form(stats, period, request_text, settings, gate, limiter, token, blocked=status["blocked"])
         return
-    if view is None:
-        live_start_form(stats, period, request_text, settings, gate, store, token)
-        return
-    live_record(view, settings, gate, store, token)
+    live_record(view, settings, gate, store, token, limiter, run_id)
 
 
-def live_start_form(stats, period, request_text, settings, gate, store, token) -> None:
+def live_start_form(stats, period, request_text, settings, gate, limiter, token, blocked: bool) -> None:
     request, message = parse_request(request_text)
     if request is None:
         st.error(message)
@@ -453,21 +445,37 @@ def live_start_form(stats, period, request_text, settings, gate, store, token) -
     for label, passed in plan.checks:
         st.markdown(f"{'✅' if passed else '❌'} {label}")
     st.info(f"승인하려면 승인 코드 **{plan.code}** 를 입력하세요. (자료·기간·목적·모델·단가가 바뀌면 코드도 바뀝니다.) "
-            "한 번 시작하면 기록이 보존되며 새 실행은 시작되지 않습니다.")
+            "유료 호출이 실제로 실행되며, 시작하면 실행 번호가 주소에 붙어 새로고침해도 이어서 볼 수 있습니다.")
     with st.form("live_start"):
         typed = st.text_input("승인 코드")
-        if st.form_submit_button("승인하고 LIVE 시작(유료 호출)", disabled=not plan.ok):
+        if st.form_submit_button("승인하고 LIVE 시작(유료 호출)", disabled=not plan.ok or blocked):
+            if typed.strip().upper() != plan.code:
+                limiter.reject()
+                st.error("승인 코드가 일치하지 않아 호출하지 않았습니다.")
+                return
             try:
-                with st.spinner("실제 API 호출 중입니다…(Collector → Reviewer, 최대 4회)"):
-                    live.start_run(store, gate, token, settings, stats, period, request, typed)
+                run_id = limiter.admit(_client_key(), plan.worst)
             except live.LiveError as error:
                 st.error(str(error))
-            else:
-                st.rerun()
+                return
+            try:
+                with st.spinner("실제 API 호출 중입니다…(Collector → Reviewer, 최대 4회)"):
+                    live.start_run(live.LiveStore(live.run_dir(run_id)), gate, token, settings, stats, period, request, typed)
+            except live.LiveError as error:
+                limiter.finish(run_id, 0.0)              # 호출 전에 거부됨: 비용 없음
+                st.error(str(error))
+                return
+            except Exception:  # noqa: BLE001 - 알 수 없는 실패는 최악 비용을 그대로 두고 실패로 센다
+                limiter.fail(run_id, None)
+                st.error("실행 중 오류가 발생했습니다. 비용은 최악값으로 계상했습니다.")
+                return
+            st.query_params["run"] = run_id
+            st.rerun()
 
 
-def live_record(view, settings, gate, store, token) -> None:
+def live_record(view, settings, gate, store, token, limiter, run_id) -> None:
     result = view.result
+    _settle(limiter, run_id, view)
     st.session_state.run_info = {
         "label": view.meta["label"], "start": view.meta["period"][0], "end": view.meta["period"][1],
         "request": view.meta["request"], "months": 0}
@@ -533,7 +541,7 @@ def live_record(view, settings, gate, store, token) -> None:
 
 def topbar(is_real: bool, live_mode: bool = False) -> None:
     """화이트 헤더: 왼쪽 네이비 제목, 오른쪽 상태 배지(실행 모드·데이터 구분·안전 표시)."""
-    mode_badge = ('<span class="badge real">LIVE 모드(로그인 필요)</span>' if live_mode
+    mode_badge = ('<span class="badge real">LIVE 모드</span>' if live_mode
                   else '<span class="badge mode">DRY_RUN 모드</span>')
     safe_badge = ('<span class="badge safe">합성 데이터만 · 승인 후 유료 호출</span>' if live_mode
                   else '<span class="badge safe">가짜 모델 · 외부 호출 0회</span>')
@@ -559,10 +567,10 @@ def main():
     st.sidebar.markdown('<div class="brand">VOC 에이전트 콘솔</div>'
                         '<div class="brand-sub">1372 항공여객운송서비스</div>', unsafe_allow_html=True)
     source = st.sidebar.radio("통계 출처", available_sources())
-    mode = st.sidebar.radio("실행 모드", ["DRY_RUN (공개 시연)", "LIVE (로그인 필요)"])
+    mode = st.sidebar.radio("실행 모드", ["DRY_RUN (공개 시연)", "LIVE (실제 API)"])
     live_mode = mode.startswith("LIVE")
     scenario = st.sidebar.selectbox("Reviewer 시나리오(DRY_RUN)", list(SCENARIOS), disabled=live_mode)
-    st.sidebar.caption("DRY_RUN은 가짜 모델만 쓰며 외부 호출이 없습니다. LIVE는 로그인된 열람자 또는 로컬 실행에서만 열리며 "
+    st.sidebar.caption("DRY_RUN은 가짜 모델만 쓰며 외부 호출이 없습니다. LIVE는 로그인 없이 쓸 수 있지만 서버 한도(전체 실행·예산, 한 번에 1명)가 있고 "
                        "합성 데이터로만 실행되며, 시작 전에 전송 범위·비용 승인이 필요합니다.")
     if len(available_sources()) == 1:
         st.sidebar.caption("로컬 집계 파일이 없어 합성 예시만 사용할 수 있습니다.")

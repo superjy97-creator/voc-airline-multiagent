@@ -305,7 +305,7 @@ KEY = "sk-test-NOT-A-REAL-KEY-0000"
 
 
 class LiveScreenTest(unittest.TestCase):
-    """LIVE 화면: 공개 환경에서는 키가 있어도 닫히고, 로컬 실행에서만 승인 코드 뒤에 합성 데이터 흐름이 동작한다."""
+    """공개 LIVE 화면(로그인 없음): 승인 코드 뒤에 합성 데이터 흐름이 동작하고, 서버 한도가 세션을 넘어 적용된다."""
 
     def setUp(self):
         import tempfile
@@ -315,7 +315,8 @@ class LiveScreenTest(unittest.TestCase):
         self.fake = FakeSdk
         folder = tempfile.TemporaryDirectory()
         self.addCleanup(folder.cleanup)
-        for patcher in (patch("voc.live_service.default_store_dir", return_value=Path(folder.name) / "voc_live"),
+        self.base = Path(folder.name) / "voc_live"
+        for patcher in (patch("voc.live_service.default_store_dir", return_value=self.base),
                         patch("voc.live_service.SdkRunner", FakeSdk),
                         patch.object(socket, "getaddrinfo", side_effect=AssertionError("네트워크 금지")),
                         patch.object(socket, "create_connection", side_effect=AssertionError("네트워크 금지"))):
@@ -324,19 +325,13 @@ class LiveScreenTest(unittest.TestCase):
         import streamlit as st
         st.cache_resource.clear()
         self.addCleanup(st.cache_resource.clear)
-        self.state = Path(folder.name) / "voc_live" / "live_web_state.json"
 
-    def app(self, *, key=True, local=False, live=True, viewer=False):
-        """local=True면 로컬(loopback) 실행으로 판정되도록 접근 판정만 대체한다(그 판정 자체는 서비스 테스트가 검증)."""
+    def app(self, *, key=True, live=True):
         at = AppTest.from_file(str(ROOT / "app.py"), default_timeout=60)
         at.secrets["OPENAI_API_KEY"] = KEY if key else ""      # 로컬 secrets.toml이 있어도 테스트는 그 값을 쓰지 않는다
-        for target, value in (("voc.live_service.local_access", local), ("voc.live_service.viewer_access", viewer)):
-            patcher = patch(target, return_value=value)
-            patcher.start()
-            self.addCleanup(patcher.stop)
         at.run()
         if live:
-            next(r for r in at.sidebar.radio if r.label == "실행 모드").set_value("LIVE (로그인 필요)")
+            next(r for r in at.sidebar.radio if r.label == "실행 모드").set_value("LIVE (실제 API)")
             at.run()
         return at
 
@@ -355,71 +350,79 @@ class LiveScreenTest(unittest.TestCase):
         return " ".join(str(e.value) for group in (at.markdown, at.info, at.error, at.warning, at.success, at.caption,
                                                   at.code, at.subheader) for e in group)
 
+    @staticmethod
+    def code():
+        from voc import live_service as svc
+        from voc.stats import synthetic_trend_stats
+        months = [f"{y}-{i:02d}" for y in (2022, 2023) for i in range(1, 13)]
+        return svc.build_plan(synthetic_trend_stats(), (months[0], months[-1]), "월별 추세 분석", (0.10, 0.50)).code
+
+    def start(self, at):
+        at = self.type_into(at, "승인 코드", self.code())
+        return self.click(at, "승인하고 LIVE 시작(유료 호출)")
+
     def test_public_default_is_dry_run_and_shows_no_live_panel(self):
         at = self.app(live=False)
         self.assertFalse(at.exception)
         self.assertNotIn("LIVE —", self.page(at))
         self.assertIn("DRY_RUN 모드", self.page(at))
 
-    def test_public_environment_keeps_live_closed_even_with_api_key(self):
-        at = self.app(key=True, local=False)
-        text = self.page(at)
-        self.assertFalse(at.exception)
-        self.assertIn("로컬 화면에서만 열립니다", text)
-        for hidden in ("승인 코드", "승인 요청서", KEY):
-            self.assertNotIn(hidden, text)
-        self.assertEqual([b.label for b in at.button if "LIVE 시작" in b.label], [])
-        self.assertTrue(next(b for b in at.button if b.label == "분석 시작").disabled)
-        self.assertEqual((self.fake.instances, self.state.exists()), ([], False))
-
-    def test_logged_in_viewer_opens_live_but_anonymous_does_not(self):
-        anonymous = self.app(local=False, viewer=False)
-        self.assertNotIn("실행 직전 승인 요청서", self.page(anonymous))
-        viewer = self.app(local=False, viewer=True)
-        self.assertIn("실행 직전 승인 요청서", self.page(viewer))
-        self.assertEqual(self.fake.instances, [])
-
-    def test_local_without_api_key_is_disabled(self):
-        at = self.app(key=False, local=True)
+    def test_live_without_api_key_is_disabled(self):
+        at = self.app(key=False)
         self.assertFalse(at.exception)
         self.assertIn("OPENAI_API_KEY)이 없어 비활성", self.page(at))
         self.assertEqual(self.fake.instances, [])
 
-    def test_local_shows_plan_and_wrong_code_makes_no_call(self):
-        at = self.app(local=True)
+    def test_visitor_without_login_sees_plan_and_wrong_code_makes_no_call(self):
+        at = self.app()
         text = self.page(at)
         self.assertIn("실행 직전 승인 요청서", text)
-        self.assertIn("gpt-6-luna", text)
+        self.assertIn("공개 이용 한도", text)
         self.assertNotIn(KEY, text)
         at = self.type_into(at, "승인 코드", "WRONG000")
         at = self.click(at, "승인하고 LIVE 시작(유료 호출)")
         self.assertIn("승인 코드가 일치하지 않아 호출하지 않았습니다", self.page(at))
-        self.assertEqual((self.fake.instances, self.state.exists()), ([], False))
+        self.assertEqual(self.fake.instances, [])
 
-    def test_full_live_flow_with_fake_sdk(self):
-        from voc import live_service as svc
-        from voc.stats import synthetic_trend_stats
-        stats = synthetic_trend_stats()
-        months = [f"{y}-{i:02d}" for y in (2022, 2023) for i in range(1, 13)]
-        code = svc.build_plan(stats, (months[0], months[-1]), "월별 추세 분석", (0.10, 0.50)).code
-        at = self.app(local=True)
-        at = self.type_into(at, "승인 코드", code)
-        at = self.click(at, "승인하고 LIVE 시작(유료 호출)")
+    def test_full_public_flow_with_fake_sdk(self):
+        at = self.start(self.app())
         self.assertFalse(at.exception)
         self.assertEqual(len(self.fake.calls), 4)
         self.assertTrue(any("Human Review" in s.value for s in at.subheader))
         at = self.click(at, "제출하고 다음 단계 실행(유료 호출)")
         self.assertEqual(len(self.fake.calls), 5)
-        self.assertTrue(any("최종 승인" in s.value for s in at.subheader))
         at = self.click(at, "최종 승인")
         self.assertTrue(any("최종 승인됨" in s.value for s in at.success))
         self.assertTrue(at.get("download_button"))
         self.assertEqual(len(self.fake.calls), 5)
-        # 새로고침(새 세션)에서는 시작 버튼이 없고 호출도 없다
-        fresh = self.app(local=True)
-        self.assertFalse(any(b.label == "승인하고 LIVE 시작(유료 호출)" for b in fresh.button))
-        self.assertEqual(len(self.fake.calls), 5)
-        self.assertNotIn(KEY, self.state.read_text(encoding="utf-8"))
+        # 끝난 실행은 정산되어 다시 시작할 수 있지만, 기록(실행 번호)이 있는 화면에서는 같은 실행이 다시 호출되지 않는다
+        self.assertAlmostEqual(self.limiter().status()["active"], 0)
+        self.assertNotIn(KEY, "".join(f.read_text(encoding="utf-8") for f in self.base.rglob("*.json")))
+
+    def limiter(self):
+        from voc import live_service as svc
+        return svc.PublicLimiter(self.base)
+
+    def test_second_visitor_cannot_start_while_another_run_is_active(self):
+        first = self.start(self.app())
+        self.assertEqual(len(self.fake.calls), 4)
+        second = self.start(self.app())                     # 다른 세션(다른 방문자)
+        self.assertIn("진행 중", self.page(second))
+        self.assertEqual(len(self.fake.calls), 4)           # 새 호출 없음
+        self.assertTrue(any("Human Review" in s.value for s in first.subheader))
+
+    def test_global_run_limit_cannot_be_bypassed_with_new_sessions(self):
+        from voc import live_service as svc
+        real = svc.PublicLimits
+        with patch.object(svc, "PublicLimits", lambda: real(max_runs_total=2, per_client_runs=99)):
+            for _ in range(2):
+                at = self.start(self.app())
+                at = self.click(at, "제출하고 다음 단계 실행(유료 호출)")
+                self.click(at, "최종 승인")
+            calls = len(self.fake.calls)
+            third = self.start(self.app())
+            self.assertIn("전체 실행 한도", self.page(third))
+            self.assertEqual(len(self.fake.calls), calls)
 
 
 if __name__ == "__main__":
