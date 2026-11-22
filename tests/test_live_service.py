@@ -41,6 +41,20 @@ class FakeSdk:
         return FakeRunner().run_stage(step)
 
 
+class LongOutputSdk(FakeSdk):
+    """실제 실행과 비슷한 길이(수집 1천·분석 1.8천·작성 3천 자)의 출력을 돌려주는 대역."""
+    sizes: ClassVar[dict] = {StageName.COLLECTOR: 1100, StageName.ANALYST: 1800, StageName.WRITER_DRAFT: 3100,
+                             StageName.WRITER_REVISION: 3100, StageName.MANAGER: 1200}
+
+    def run_stage(self, step):
+        result = super().run_stage(step)
+        size = self.sizes.get(step.stage)
+        if size is None:
+            return result
+        text = (result.output_text or "") + " " + "집계 기반 서술입니다. " * (size // 12)
+        return replace(result, output_text=text[:size])
+
+
 def client_factory(api_key):
     assert api_key == KEY
     return Mock(max_retries=0)
@@ -174,6 +188,19 @@ class LiveServiceTest(unittest.TestCase):
         svc.finalize(self.store, self.gate, self.token, True)
         self.assertIs(self.view().result.approval, ApprovalStatus.APPROVED)
         self.assertEqual(len(FakeSdk.calls), 5)       # 최종 승인은 호출이 없다
+
+    def test_realistic_output_lengths_are_not_blocked_by_input_cap(self):
+        """첫 실제 실행의 회귀: 이전 단계 출력이 길어져도 Reviewer·Manager 입력이 상한에 막히지 않아야 한다."""
+        with patch.object(svc, "SdkRunner", LongOutputSdk):
+            self.start()
+            view = self.view()
+            self.assertEqual(len(FakeSdk.calls), 4)
+            self.assertIs(next_step(view.result).stage, StageName.HUMAN_REVIEW)
+            self.assertIsNone(next_step(view.result).stop_reason)
+            self.go()
+        self.assertIs(next_step(self.view().result).stage, StageName.FINAL_APPROVAL)
+        self.assertEqual(svc.INPUT_CAP_CHARS, 10_000)
+        self.assertLessEqual(self.plan.worst, svc.DEFAULT_COST_CAP)
 
     def test_revision_path_stays_within_nine_calls(self):
         self.start()

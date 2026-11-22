@@ -44,7 +44,7 @@ from voc.live_core import (
     stage_cost,
     usd,
 )
-from voc.pipeline import DRY_RUN_LIMITS, HumanInput, RunContext, advance, new_run
+from voc.pipeline import HumanInput, RunContext, advance, new_run
 from voc.runners import MAX_TURNS, SdkRunner
 from voc.sanitize import make_checked_text
 from voc.stats import (
@@ -57,6 +57,7 @@ from voc.stats import (
 OPENAI_URL = "https://api.openai.com/v1"
 PRICE_FLOOR = (0.10, 0.50)      # 사용자가 승인한 100만 토큰당 단가(입력, 출력). 이보다 낮은 설정은 거부한다.
 MAX_OUTPUT_TOKENS = 2500
+INPUT_CAP_CHARS = 10_000   # 호출당 입력 글자 상한. 첫 실제 실행에서 4,000자는 Reviewer 입력(약 6,450자)보다 작아 차단됐다.
 MIN_PASSWORD_CHARS = 12
 STATE_NAME, LOCK_NAME = "live_web_state.json", "live_web.lock"
 
@@ -210,7 +211,7 @@ def build_plan(stats, period: tuple[str, str], request: str, prices: tuple[float
         raise LiveError("실제 집계 자료의 LIVE는 별도 승인 전까지 비활성입니다. 합성 자료만 선택할 수 있습니다.")
     sanitized = to_sanitized_monthly(stats, SourceKind.SYNTHETIC, period=period, request=request)
     est = estimate(stats, MAX_OUTPUT_TOKENS, lambda s: to_sanitized_monthly(
-        s, SourceKind.SYNTHETIC, period=period, request=request))
+        s, SourceKind.SYNTHETIC, period=period, request=request), INPUT_CAP_CHARS)
     per_call = stage_cost(est, prices)
     worst = MAX_CALLS * per_call
     ceiling = usd(est["input_tokens_ceiling"], prices[0]) + usd(est["output_tokens_ceiling"], prices[1])
@@ -254,7 +255,7 @@ class _JournalRunner:
 
 
 def _limits() -> RunLimits:
-    return RunLimits(max_input_chars_per_call=DRY_RUN_LIMITS.max_input_chars_per_call,
+    return RunLimits(max_input_chars_per_call=INPUT_CAP_CHARS,
                      max_output_tokens_per_call=MAX_OUTPUT_TOKENS, max_cost_usd=DEFAULT_COST_CAP)
 
 
@@ -268,7 +269,7 @@ def _make_context(settings: LiveSettings, stats, meta: dict, budget: CallBudget,
     sanitized = to_sanitized_monthly(stats, SourceKind.SYNTHETIC, period=tuple(meta["period"]),
                                      request=meta["request"])
     est = estimate(stats, MAX_OUTPUT_TOKENS, lambda s: to_sanitized_monthly(
-        s, SourceKind.SYNTHETIC, period=tuple(meta["period"]), request=meta["request"]))
+        s, SourceKind.SYNTHETIC, period=tuple(meta["period"]), request=meta["request"]), INPUT_CAP_CHARS)
     client = client_factory(settings.api_key)
     inner = SdkRunner(VOC_AGENT_MODEL, approved_live=True, max_output_tokens=MAX_OUTPUT_TOKENS, client=client)
     logging = LoggingRunner(inner, prices, DEFAULT_COST_CAP, stage_cost(est, prices), usage, errors,
