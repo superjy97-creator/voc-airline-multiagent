@@ -1,7 +1,9 @@
-"""VOC 개선 CX 대시보드 (Streamlit) — DRY_RUN 전용 시연 화면.
+"""VOC 개선 CX 대시보드 (Streamlit).
 
 실행: cd voc_consumer_analysis  →  streamlit run app.py
-이 화면은 가짜 모델(FakeRunner)만 사용한다. 외부 API 호출·상담 원문 사용 없음.
+- DRY_RUN(기본·공개): 가짜 모델(FakeRunner)만 사용한다. 외부 API 호출·상담 원문 사용 없음.
+- LIVE(관리자 전용, 합성 데이터 한정): 서버 비밀값이 설정돼 있고 관리자 인증을 통과해야만 열린다.
+  모든 권한 검사와 유료 호출 통제는 서버 측 voc.live_service가 수행한다.
 """
 
 import sys
@@ -15,6 +17,7 @@ import altair as alt
 import pandas as pd
 import streamlit as st
 
+from voc import live_service as live
 from voc.analysis_request import MAX_REQUEST_CHARS, SUPPORTED_HELP, parse_request
 from voc.contracts import (
     ERROR_MESSAGES,
@@ -295,14 +298,14 @@ def stage_io(result):
                 previous.append(label)
 
 
-def show_progress(result):
+def show_progress(result, live_mode: bool = False):
     st.markdown('<div class="sec">AI 에이전트 진행 상황</div>', unsafe_allow_html=True)
     info = st.session_state.get("run_info")
     if info:
         st.caption(f"실행한 요청: ‘{info['request']}’ · 자료 {info['label']} · 분석 기간 {info['start']}~{info['end']}")
     st.markdown(flow_html(result), unsafe_allow_html=True)
-    st.progress(min(result.calls_used / 9, 1.0),
-                text=f"모델 호출 {result.calls_used} / 9회 (DRY_RUN: 외부 호출 0회)")
+    note = "LIVE: 실제 API 호출" if live_mode else "DRY_RUN: 외부 호출 0회"
+    st.progress(min(result.calls_used / 9, 1.0), text=f"모델 호출 {result.calls_used} / 9회 ({note})")
     rows = []
     for s in result.stages:
         tag = s.verdict or s.human_decision
@@ -345,15 +348,184 @@ def final_approval(result):
         st.error(str(error))
 
 
-def topbar(is_real: bool) -> None:
+def _secret(name: str):
+    """서버 비밀값을 읽는다(화면·상태 파일·로그에 쓰지 않는다). 설정이 없으면 None."""
+    try:
+        return st.secrets.get(name)
+    except Exception:  # noqa: BLE001 - 비밀 파일이 없는 환경(공개 DRY_RUN)은 LIVE 비활성
+        return None
+
+
+@st.cache_resource
+def _live_gate(password: str) -> live.AdminGate:
+    return live.AdminGate(password)
+
+
+@st.cache_resource
+def _live_store() -> live.LiveStore:
+    return live.LiveStore()
+
+
+def live_usage_table(view) -> None:
+    rows = [{"단계": u["stage"], "요청": u["requests"], "입력 토큰": u["input_tokens"],
+             "출력 토큰": u["output_tokens"], "구분": "실패·최악값 계상" if u.get("estimated") else "실제 사용량"}
+            for u in view.usage]
+    st.dataframe(rows, width="stretch", hide_index=True)
+    st.caption(f"실제 사용량 기반 계산 비용 ${view.spent:.6f} (단가 입력 {view.meta['prices'][0]} / 출력 "
+               f"{view.meta['prices'][1]} USD/100만 토큰). 사전 추정치와 다르며 청구액은 OpenAI 대시보드에서 확인하세요.")
+
+
+def live_panel(stats, period: tuple[str, str], request_text: str, is_real: bool) -> None:
+    """LIVE 영역. 인증·승인·중복 방지는 모두 voc.live_service가 서버 측에서 강제한다."""
+    st.markdown('<div class="sec">LIVE — 실제 API 실행(관리자 전용, 합성 데이터 한정)</div>', unsafe_allow_html=True)
+    try:
+        settings = live.load_settings(_secret)
+    except live.LiveError as error:
+        st.error(str(error))
+        return
+    if settings is None:
+        st.info("LIVE는 서버 설정이 없어 비활성입니다. 이 배포에서는 DRY_RUN만 사용할 수 있습니다.")
+        return
+    gate, store = _live_gate(settings.admin_password), _live_store()
+    token = st.session_state.get("admin_token")
+    if not gate.valid(token):
+        with st.form("admin_login"):
+            password = st.text_input("관리자 암호", type="password")
+            if st.form_submit_button("관리자 로그인"):
+                try:
+                    issued = gate.login(password)
+                except live.LiveError as error:
+                    st.error(str(error))
+                else:
+                    if issued:
+                        st.session_state.admin_token = issued
+                        st.rerun()
+                    st.error("암호가 올바르지 않습니다.")
+        st.caption("관리자 인증 없이는 API 키에 접근하지도, LIVE를 실행하지도 않습니다.")
+        return
+    if st.button("관리자 로그아웃"):
+        gate.logout(token)
+        st.session_state.pop("admin_token", None)
+        st.rerun()
+    if is_real:
+        st.error("실제 집계 자료의 LIVE는 이용 조건 확인과 별도 승인 전까지 비활성입니다. 합성 자료를 선택하세요.")
+        return
+    try:
+        view = live.load_view(store, gate, token)
+    except live.LiveError as error:
+        st.error(str(error))
+        return
+    if view is None:
+        live_start_form(stats, period, request_text, settings, gate, store, token)
+        return
+    live_record(view, settings, gate, store, token)
+
+
+def live_start_form(stats, period, request_text, settings, gate, store, token) -> None:
+    request, message = parse_request(request_text)
+    if request is None:
+        st.error(message)
+        return
+    try:
+        plan = live.build_plan(stats, period, request, (settings.price_in, settings.price_out))
+    except live.LiveError as error:
+        st.error(str(error))
+        return
+    st.markdown("**실행 직전 승인 요청서**")
+    st.code(plan.text(), language=None, wrap_lines=True)
+    for label, passed in plan.checks:
+        st.markdown(f"{'✅' if passed else '❌'} {label}")
+    st.info(f"승인하려면 승인 코드 **{plan.code}** 를 입력하세요. (자료·기간·목적·모델·단가가 바뀌면 코드도 바뀝니다.) "
+            "한 번 시작하면 기록이 보존되며 새 실행은 시작되지 않습니다.")
+    with st.form("live_start"):
+        typed = st.text_input("승인 코드")
+        if st.form_submit_button("승인하고 LIVE 시작(유료 호출)", disabled=not plan.ok):
+            try:
+                with st.spinner("실제 API 호출 중입니다…(Collector → Reviewer, 최대 4회)"):
+                    live.start_run(store, gate, token, settings, stats, period, request, typed)
+            except live.LiveError as error:
+                st.error(str(error))
+            else:
+                st.rerun()
+
+
+def live_record(view, settings, gate, store, token) -> None:
+    result = view.result
+    st.session_state.run_info = {
+        "label": view.meta["label"], "start": view.meta["period"][0], "end": view.meta["period"][1],
+        "request": view.meta["request"], "months": 0}
+    st.caption(f"LIVE 실행 기록 · 모델 {view.meta['model']} · 시작 {view.meta['started']} · "
+               "합성 데이터 · 실제 VOC 분석 결과 아님")
+    show_progress(result, live_mode=True)
+    live_usage_table(view)
+    step = next_step(result)
+    if view.interrupted:
+        st.error("이전 호출이 도중에 끊겨 과금 여부를 알 수 없습니다. 더 호출하지 않습니다.")
+    elif result.approval is ApprovalStatus.APPROVED:
+        st.success("최종 승인됨 (LIVE · 합성 데이터)")
+    elif result.approval is ApprovalStatus.REJECTED:
+        st.warning("사용자가 반려했습니다.")
+    elif step.stop_reason is not None:
+        st.error(f"중단: {ERROR_MESSAGES[step.stop_reason]}")
+    elif step.stage is StageName.HUMAN_REVIEW:
+        st.subheader("Human Review")
+        review = latest_output(result, StageName.REVIEWER, StageName.REVIEWER_RECHECK)
+        with st.expander("Reviewer 검수 결과", expanded=True):
+            st.markdown(review or "검수 결과 없음")
+        left = 9 - result.calls_used
+        st.warning(f"제출하면 다음 단계의 유료 호출이 실행됩니다(남은 호출 최대 {left}회, 누적 계산 비용 ${view.spent:.6f}).")
+        with st.form("live_human"):
+            choice = st.radio("결정", list(DECISIONS))
+            notes = st.text_area("수정 요청 메모(개인정보·상담 원문 입력 금지)", "")
+            if st.form_submit_button("제출하고 다음 단계 실행(유료 호출)"):
+                try:
+                    with st.spinner("실제 API 호출 중입니다…"):
+                        live.continue_run(store, gate, token, settings, view.stage_count,
+                                          HumanInput(DECISIONS[choice], notes.strip() or None))
+                except (live.LiveError, ValueError) as error:
+                    st.error(str(error))
+                else:
+                    st.rerun()
+    elif step.stage is StageName.FINAL_APPROVAL:
+        st.subheader("최종 승인")
+        st.info("승인 전 결과는 DRAFT입니다. 사용자가 직접 결정합니다(추가 호출 없음).")
+        approve_col, reject_col = st.columns(2)
+        decision = (True if approve_col.button("최종 승인", type="primary") else
+                    False if reject_col.button("반려") else None)
+        if decision is not None:
+            try:
+                live.finalize(store, gate, token, decision)
+            except live.LiveError as error:
+                st.error(str(error))
+            else:
+                st.rerun()
+    report = latest_output(result, StageName.WRITER_REVISION, StageName.WRITER_DRAFT)
+    if report:
+        st.subheader(f"보고서 ({result.approval.value})")
+        with st.container(border=True):
+            st.markdown(report)
+        st.download_button("보고서 내려받기(.md)",
+                           f"<!-- LIVE 합성 데이터 · 실제 분석 결과 아님 -->\n\n{report}\n",
+                           file_name="voc_live_report.md")
+    summary = latest_output(result, StageName.MANAGER)
+    if summary:
+        with st.expander("Manager 종합"):
+            st.markdown(summary)
+    stage_io(result)
+
+
+def topbar(is_real: bool, live_mode: bool = False) -> None:
     """화이트 헤더: 왼쪽 네이비 제목, 오른쪽 상태 배지(실행 모드·데이터 구분·안전 표시)."""
+    mode_badge = ('<span class="badge real">LIVE 모드(관리자 전용)</span>' if live_mode
+                  else '<span class="badge mode">DRY_RUN 모드</span>')
+    safe_badge = ('<span class="badge safe">합성 데이터만 · 승인 후 유료 호출</span>' if live_mode
+                  else '<span class="badge safe">가짜 모델 · 외부 호출 0회</span>')
     data_badge = ('<span class="badge real">로컬 실제 집계(상담 원문 아님)</span>' if is_real
                   else '<span class="badge synthetic">합성 데이터(실제 수치 아님)</span>')
     st.markdown(
         '<div class="topbar"><div><h1>항공여객운송서비스 VOC 개선 대시보드</h1>'
         "<p>5개 AI 에이전트가 VOC를 정리·분석·작성·검수·종합하고, 사람이 검토·승인합니다.</p></div>"
-        f'<div class="badges"><span class="badge mode">DRY_RUN 모드</span>{data_badge}'
-        '<span class="badge safe">가짜 모델 · 외부 호출 0회</span></div></div>',
+        f'<div class="badges">{mode_badge}{data_badge}{safe_badge}</div></div>',
         unsafe_allow_html=True,
     )
     if is_real:
@@ -370,13 +542,15 @@ def main():
     st.sidebar.markdown('<div class="brand">VOC 에이전트 콘솔</div>'
                         '<div class="brand-sub">1372 항공여객운송서비스</div>', unsafe_allow_html=True)
     source = st.sidebar.radio("통계 출처", available_sources())
-    scenario = st.sidebar.selectbox("Reviewer 시나리오(DRY_RUN)", list(SCENARIOS))
-    st.sidebar.caption("이 화면은 DRY_RUN 전용이며 LIVE(실제 API)는 실행되지 않습니다. "
-                       "LIVE 테스트는 scripts/live_smoke.py로 별도 실행합니다.")
+    mode = st.sidebar.radio("실행 모드", ["DRY_RUN (공개 시연)", "LIVE (관리자 전용)"])
+    live_mode = mode.startswith("LIVE")
+    scenario = st.sidebar.selectbox("Reviewer 시나리오(DRY_RUN)", list(SCENARIOS), disabled=live_mode)
+    st.sidebar.caption("DRY_RUN은 가짜 모델만 쓰며 외부 호출이 없습니다. LIVE는 서버 설정과 관리자 인증이 있어야 하고 "
+                       "합성 데이터로만 실행되며, 시작 전에 전송 범위·비용 승인이 필요합니다.")
     if len(available_sources()) == 1:
         st.sidebar.caption("로컬 집계 파일이 없어 합성 예시만 사용할 수 있습니다.")
     is_real = source == LOCAL_SOURCE
-    topbar(is_real)
+    topbar(is_real, live_mode)
 
     all_stats = load_stats(source)
     if not all_stats:
@@ -393,13 +567,18 @@ def main():
         end = pick_end.selectbox("분석 종료월", months, index=len(months) - 1)
         request_text = st.text_input("자연어 요청", value="월별 추세를 분석해 주세요", max_chars=MAX_REQUEST_CHARS,
                                      placeholder="예: 급증 구간을 확인해 주세요")
-        st.caption(SUPPORTED_HELP + " · 이 화면은 입력 문장을 AI 모델·외부 API로 보내지 않습니다(DRY_RUN).")
-        clicked = st.button("분석 시작", type="primary")
+        st.caption(SUPPORTED_HELP + " · 입력 문장은 AI 모델·외부 API로 보내지 않고, 목적 이름만 숫자·날짜와 함께 전달됩니다.")
+        clicked = st.button("분석 시작", type="primary", disabled=live_mode)
     period_ok = start <= end
     if not period_ok:
         st.error("분석 시작월은 종료월보다 늦을 수 없습니다.")
     show_stats(stats, is_real, (start, end) if period_ok else None)
     st.caption("통계는 자료별로 분리되어 있으며 서로 합산하지 않습니다.")
+
+    if live_mode:
+        if period_ok:
+            live_panel(stats, (start, end), request_text, is_real)
+        return
 
     if clicked and period_ok:
         request, message = parse_request(request_text)
