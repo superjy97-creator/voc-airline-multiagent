@@ -11,9 +11,11 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT / "src"))
 
+import altair as alt
 import pandas as pd
 import streamlit as st
 
+from voc.analysis_request import MAX_REQUEST_CHARS, SUPPORTED_HELP, parse_request
 from voc.contracts import (
     ERROR_MESSAGES,
     ApprovalStatus,
@@ -28,7 +30,14 @@ from voc.contracts import (
 from voc.pipeline import DRY_RUN_LIMITS, HumanInput, RunContext, advance, new_run
 from voc.runners import FakeRunner
 from voc.sanitize import make_checked_text
-from voc.stats import load_summary, synthetic_stats, to_provenance, to_sanitized
+from voc.stats import (
+    load_summary,
+    month_series,
+    synthetic_stats,
+    synthetic_trend_stats,
+    to_provenance,
+    to_sanitized_monthly,
+)
 
 SUMMARY_PATH = ROOT / "reports" / "stats_summary.json"
 SYNTHETIC_SOURCE = "합성 예시(실제 수치 아님)"
@@ -116,7 +125,7 @@ CSS = """
 @st.cache_data
 def load_stats(source: str):
     if source == SYNTHETIC_SOURCE:
-        return synthetic_stats()
+        return (synthetic_trend_stats(), *synthetic_stats())
     return load_summary(SUMMARY_PATH) if SUMMARY_PATH.exists() else ()
 
 
@@ -177,18 +186,59 @@ def kpi_html(label: str, value: str, accent: str, tag: tuple[str, str] | None = 
             f'<div class="v">{escape(value)}</div></div>')
 
 
-def start_run(stats, source_kind, scenario):
+def start_run(stats, source_kind, scenario, period, request):
+    """DRY_RUN 실행. 사용자의 문장은 쓰지 않고, 열거된 요청 이름(request)과 월 범위만 입력에 넣는다."""
     st.session_state.runs = st.session_state.get("runs", 0) + 1
     result = new_run(f"dryrun-{st.session_state.runs}", (to_provenance(stats),))
+    sanitized = to_sanitized_monthly(stats, source_kind, period=period, request=request)
     ctx = RunContext(
-        sanitized=to_sanitized(stats, source_kind), runner=FakeRunner(SCENARIOS[scenario]),
+        sanitized=sanitized, runner=FakeRunner(SCENARIOS[scenario]),
         budget=CallBudget(DRY_RUN_LIMITS), to_checked=make_checked_text,
     )
     st.session_state.ctx = ctx
+    st.session_state.run_info = {"label": stats.label, "start": period[0], "end": period[1], "request": request,
+                                 "months": sum(1 for name, _ in sanitized.fields if name.startswith("건수_"))}
     st.session_state.result = advance(result, ctx)
 
 
-def show_stats(stats, is_real: bool = False):
+def period_summary(stats, start: str, end: str) -> dict | None:
+    """선택 기간의 합계·월평균·최대 월·첫 달 대비 마지막 달 증감(입력 집계값만 사용)."""
+    items = [(m, v) for m, v in month_series(stats) if start <= m <= end]
+    if not items:
+        return None
+    total = sum(v for _, v in items)
+    first, last = items[0][1], items[-1][1]
+    return {"total": total, "avg": total / len(items), "peak": max(items, key=lambda p: p[1]),
+            "change": (last - first) / first * 100 if first else None, "n": len(items)}
+
+
+def trend_chart(stats, period: tuple[str, str]) -> alt.LayerChart | alt.FacetChart:
+    """월별 막대(선택 기간 강조) + 3개월 이동평균 선. 날짜 축은 YYYY-MM, 눈금·막대 폭은 개월 수에 맞춘다."""
+    series = month_series(stats)
+    frame = pd.DataFrame({
+        "month": pd.PeriodIndex([m for m, _ in series], freq="M").to_timestamp(),
+        "count": [v for _, v in series],
+        "scope": ["분석 기간" if period[0] <= m <= period[1] else "기간 밖" for m, _ in series],
+    })
+    n = len(frame)
+    step = 1 if n <= 14 else 2 if n <= 26 else 3 if n <= 40 else 6
+    size = 18 if n <= 14 else 13 if n <= 26 else 9 if n <= 40 else 7
+    axis = alt.Axis(format="%Y-%m", labelAngle=-45, tickCount={"interval": "month", "step": step},
+                    labelOverlap=True, grid=False)
+    base = alt.Chart(frame).encode(x=alt.X("month:T", title="접수월", axis=axis))
+    bars = base.mark_bar(size=size, cornerRadiusTopLeft=2, cornerRadiusTopRight=2).encode(
+        y=alt.Y("count:Q", title="항공 상담 건수"),
+        color=alt.Color("scope:N", title=None, scale=alt.Scale(domain=["분석 기간", "기간 밖"],
+                                                              range=["#12B5A6", "#C9D3E2"]),
+                        legend=alt.Legend(orient="top")),
+        tooltip=[alt.Tooltip("month:T", title="접수월", format="%Y-%m"), alt.Tooltip("count:Q", title="건수", format=",")],
+    )
+    average = (base.mark_line(color="#0B1F3A", strokeWidth=2, point=False)
+               .transform_window(avg="mean(count)", frame=[-1, 1]).encode(y="avg:Q"))
+    return alt.layer(bars, average).properties(height=300).configure_axis(labelFontSize=12, titleFontSize=12)
+
+
+def show_stats(stats, is_real: bool = False, period: tuple[str, str] | None = None):
     tag = ("real", "실제 집계") if is_real else ("synthetic", "합성")
     ratio = f"{stats.air_rows / stats.total_rows:.2%}" if stats.total_rows else "-"
     cards = (("분모(전체 상담 행)", f"{stats.total_rows:,}", "navy"),
@@ -197,18 +247,56 @@ def show_stats(stats, is_real: bool = False):
              ("판정 불가", f"{stats.undetermined_rows:,}", "gray"))
     for column, (label, value, accent) in zip(st.columns(4), cards, strict=True):
         column.markdown(kpi_html(label, value, accent, tag), unsafe_allow_html=True)
-    st.caption(f"{stats.label} · {stats.unit} · 기간 {stats.period_start} ~ {stats.period_end}")
-    if stats.monthly:
-        st.markdown('<div class="sec">월별 항공여객운송서비스 상담 건수</div>', unsafe_allow_html=True)
-        frame = pd.DataFrame(stats.monthly, columns=["월", "건수"]).set_index("월")
+    st.caption(f"{stats.label} · {stats.unit} · 전체 기간 {stats.period_start} ~ {stats.period_end}")
+    series = month_series(stats)
+    if series and period is not None:
+        summary = period_summary(stats, *period)
+        if summary:
+            change = f"{summary['change']:+.1f}%" if summary["change"] is not None else "-"
+            sub = (("분석 기간 합계", f"{summary['total']:,}건", "blue"),
+                   ("월평균", f"{summary['avg']:,.1f}건", "teal"),
+                   ("최대 월", f"{summary['peak'][0]} ({summary['peak'][1]:,})", "navy"),
+                   ("첫 달 대비 마지막 달", change, "gray"))
+            for column, (label, value, accent) in zip(st.columns(4), sub, strict=True):
+                column.markdown(kpi_html(label, value, accent, tag), unsafe_allow_html=True)
+            st.caption(f"분석 기간 {period[0]} ~ {period[1]} ({summary['n']}개월)")
+        st.markdown('<div class="sec">월별 항공여객운송서비스 상담 건수 (막대: 월별, 선: 3개월 이동평균)</div>',
+                    unsafe_allow_html=True)
         with st.container(border=True):
-            st.bar_chart(frame, color="#12B5A6", height=260)
+            st.altair_chart(trend_chart(stats, period), width="stretch")
     for note in stats.notes:
         st.caption(f"• {note}")
 
 
+def stage_io(result):
+    """단계별 입력(자료·기간·요청·이전 단계 출력)과 출력을 펼쳐 볼 수 있게 한다. DRY_RUN은 외부로 아무것도 보내지 않는다."""
+    info = st.session_state.get("run_info") or {}
+    st.markdown('<div class="sec">단계별 입력·출력</div>', unsafe_allow_html=True)
+    previous: list[str] = []
+    for s in result.stages:
+        if s.status is StageStatus.SKIPPED:
+            continue
+        label = str(STAGE_LABELS.get(s.stage, s.stage.value)) + (f" · {s.round_no}회차" if s.round_no else "")
+        with st.expander(f"{label} — {STATUS_LABELS.get(s.status, s.status.value)}"):
+            if s.stage is StageName.HUMAN_REVIEW:
+                decision = s.human_decision.value if s.human_decision else "-"
+                st.markdown(f"**입력:** 이전 단계 출력({', '.join(previous) or '없음'}) · **사람 결정:** {decision}")
+            else:
+                st.markdown(
+                    f"**입력:** 자료 {info.get('label', '-')} · 분석 기간 {info.get('start', '-')}~{info.get('end', '-')}"
+                    f" · 요청 ‘{info.get('request', '-')}’ · 월별 집계 {info.get('months', 0)}개(원문·개인정보 없음)"
+                    f" · 이전 단계 출력: {', '.join(previous) or '없음'}")
+                st.markdown("**출력:**")
+                st.markdown(s.output_text or "출력 없음")
+            if s.status is StageStatus.SUCCEEDED:
+                previous.append(label)
+
+
 def show_progress(result):
     st.markdown('<div class="sec">AI 에이전트 진행 상황</div>', unsafe_allow_html=True)
+    info = st.session_state.get("run_info")
+    if info:
+        st.caption(f"실행한 요청: ‘{info['request']}’ · 자료 {info['label']} · 분석 기간 {info['start']}~{info['end']}")
     st.markdown(flow_html(result), unsafe_allow_html=True)
     st.progress(min(result.calls_used / 9, 1.0),
                 text=f"모델 호출 {result.calls_used} / 9회 (DRY_RUN: 외부 호출 0회)")
@@ -291,24 +379,41 @@ def main():
     if not all_stats:
         st.error("집계 파일이 없습니다. 합성 예시를 선택하세요.")
         return
-    label = st.selectbox("자료", [s.label for s in all_stats])   # 위젯은 한 번만 만든다(중복 ID 방지)
-    stats = next(s for s in all_stats if s.label == label)
-    show_stats(stats, is_real)
+    kind = SourceKind.REAL if is_real else SourceKind.SYNTHETIC
+    with st.container(border=True):
+        st.markdown('<div class="sec" style="margin-top:0">분석 요청</div>', unsafe_allow_html=True)
+        pick_data, pick_start, pick_end = st.columns([2, 1, 1])
+        label = pick_data.selectbox("자료", [s.label for s in all_stats])   # 위젯은 한 번만 만든다(중복 ID 방지)
+        stats = next(s for s in all_stats if s.label == label)
+        months = [m for m, _ in month_series(stats)]
+        start = pick_start.selectbox("분석 시작월", months, index=0)
+        end = pick_end.selectbox("분석 종료월", months, index=len(months) - 1)
+        request_text = st.text_input("자연어 요청", value="월별 추세를 분석해 주세요", max_chars=MAX_REQUEST_CHARS,
+                                     placeholder="예: 급증 구간을 확인해 주세요")
+        st.caption(SUPPORTED_HELP + " · 이 화면은 입력 문장을 AI 모델·외부 API로 보내지 않습니다(DRY_RUN).")
+        clicked = st.button("분석 시작", type="primary")
+    period_ok = start <= end
+    if not period_ok:
+        st.error("분석 시작월은 종료월보다 늦을 수 없습니다.")
+    show_stats(stats, is_real, (start, end) if period_ok else None)
     st.caption("통계는 자료별로 분리되어 있으며 서로 합산하지 않습니다.")
 
-    kind = SourceKind.REAL if is_real else SourceKind.SYNTHETIC
-    if st.button("DRY_RUN 시작/다시 시작", type="primary"):
-        start_run(stats, kind, scenario)
-        st.session_state.run_basis = (source, label)
-        st.rerun()
+    if clicked and period_ok:
+        request, message = parse_request(request_text)
+        if request is None:
+            st.error(message)            # 지원하지 않는 자유 입력은 거부하고 실행하지 않는다
+        else:
+            start_run(stats, kind, scenario, (start, end), request)
+            st.session_state.run_basis = (source, label, start, end)
+            st.rerun()
 
     result, ctx = st.session_state.get("result"), st.session_state.get("ctx")
-    if result is not None and st.session_state.get("run_basis") != (source, label):
-        st.warning("현재 선택한 자료와 다른 자료로 실행한 결과입니다. 선택한 자료로 보려면 ‘DRY_RUN 시작’을 다시 누르세요.")
+    if result is not None and st.session_state.get("run_basis") != (source, label, start, end):
+        st.warning("현재 선택한 자료·기간과 다른 조건으로 실행한 결과입니다. 선택한 조건으로 보려면 ‘분석 시작’을 다시 누르세요.")
     if result is None:
         st.markdown('<div class="sec">AI 에이전트 진행 상황</div>', unsafe_allow_html=True)
         st.markdown(flow_html(None), unsafe_allow_html=True)
-        st.caption("‘DRY_RUN 시작’을 누르면 Collector부터 Reviewer까지 자동 진행하고, Human Review에서 멈춥니다.")
+        st.caption("‘분석 시작’을 누르면 Collector부터 Reviewer까지 자동 진행하고, Human Review에서 멈춥니다.")
         return
     st.divider()
     show_progress(result)
@@ -334,6 +439,7 @@ def main():
     if summary:
         with st.expander("Manager 종합"):
             st.markdown(summary)
+    stage_io(result)
 
 
 if __name__ == "__main__":

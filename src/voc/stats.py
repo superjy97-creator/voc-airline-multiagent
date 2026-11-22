@@ -130,7 +130,8 @@ def to_sanitized(stats: DatasetStats, source_kind: SourceKind) -> SanitizedInput
     )
 
 
-DATASET_SCOPES = {"receipt": "전체 상담 접수", "online": "온라인 상거래 상담", "hazard": "위해위험 상담"}
+DATASET_SCOPES = {"receipt": "전체 상담 접수", "online": "온라인 상거래 상담", "hazard": "위해위험 상담",
+                  "합성_A": "합성 예시", "합성_B": "합성 예시", "합성_C": "합성 예시"}
 
 
 def _month_range(start: str, end: str) -> list[str]:
@@ -143,10 +144,25 @@ def _month_range(start: str, end: str) -> list[str]:
     return months
 
 
-def to_sanitized_monthly(stats: DatasetStats, source_kind: SourceKind) -> SanitizedInput:
+def month_series(stats: DatasetStats) -> list[tuple[str, int]]:
+    """기간 안의 모든 달(항공 행이 없는 달은 0)과 건수. 화면과 전송 입력이 같은 월 범위를 쓴다."""
+    counts = dict(stats.monthly)
+    starts = [stats.period_start[:7]] if stats.period_start else []
+    ends = [stats.period_end[:7]] if stats.period_end else []
+    if not (starts or counts):
+        return []
+    return [(m, counts.get(m, 0)) for m in _month_range(min([*starts, *counts]), max([*ends, *counts]))]
+
+
+def to_sanitized_monthly(
+    stats: DatasetStats, source_kind: SourceKind, *, period: tuple[str, str] | None = None,
+    request: str | None = None,
+) -> SanitizedInput:
     """월별 변화 분석용 입력(voc_monthly_v1). 집계값·열거값·기간만 담으며 원문·제목·자유 문자열은 불가능하다.
 
     기간 안에서 항공 행이 없는 달은 0으로 명시하고(필드 누락과 구분), 자료 한계는 열거값으로 전달한다.
+    period=('YYYY-MM','YYYY-MM')를 주면 그 범위의 월별 값만 담고 분석기간 필드를 추가하며(요약 필드는 전체 기준),
+    request는 ANALYSIS_REQUESTS 중 하나여야 한다(스키마가 검증).
     """
     if stats.period_start is None or stats.period_end is None:
         raise ValueError("유효한 접수 기간이 있어야 합니다.")
@@ -156,8 +172,6 @@ def to_sanitized_monthly(stats: DatasetStats, source_kind: SourceKind) -> Saniti
     counts = dict(stats.monthly)
     if sum(counts.values()) != stats.air_rows or stats.air_rows > stats.total_rows:
         raise ValueError("월별 합계가 항공 건수와 다르거나 항공 건수가 전체 건수보다 큽니다.")
-    first = min([stats.period_start[:7], *counts])
-    last = max([stats.period_end[:7], *counts])
     year, month, day = int(stats.period_end[:4]), int(stats.period_end[5:7]), int(stats.period_end[8:10])
     partial = "예" if day != calendar.monthrange(year, month)[1] else "아니오"
     truncated = "예" if any("상한" in note for note in stats.notes) else "미확인"
@@ -169,7 +183,16 @@ def to_sanitized_monthly(stats: DatasetStats, source_kind: SourceKind) -> Saniti
         ("비율", ratio), ("마지막월_부분집계", partial), ("행수_상한_절단_가능성", truncated),
         ("요청_절구성", REQUEST_SECTIONS), ("해석_원칙", INTERPRETATION_RULE),
     ]
-    fields += [(f"건수_{m}", counts.get(m, 0)) for m in _month_range(first, last)]
+    months = [m for m, _ in month_series(stats)]
+    if period is not None:
+        start, end = period
+        months = [m for m in months if start <= m <= end]
+        if not months:
+            raise ValueError("선택한 분석 기간에 해당하는 월이 없습니다.")
+        fields += [("분석기간_시작", months[0]), ("분석기간_종료", months[-1])]
+    if request is not None:
+        fields.append(("분석_요청", request))
+    fields += [(f"건수_{m}", counts.get(m, 0)) for m in months]
     return SanitizedInput(source_kind=source_kind, dataset_id=stats.dataset_id,
                           schema_version="voc_monthly_v1", fields=tuple(fields))
 
@@ -191,6 +214,15 @@ def synthetic_stats() -> tuple[DatasetStats, ...]:
         DatasetStats("합성_B", "합성 B", UNIT, 20, 3, 0, "2020-03-01", "2020-03-31",
                      (("2020-03", 3),), 2, 1, notes),
     )
+
+
+def synthetic_trend_stats() -> DatasetStats:
+    """화면 시연용 24개월 합성 추세(실제 수치 아님). 여름철 증가와 가을 감소 패턴을 가상으로 만든 값이다."""
+    values = [88, 92, 85, 97, 110, 125, 160, 172, 140, 118, 103, 96,
+              101, 98, 94, 108, 122, 138, 181, 196, 152, 127, 111, 104]
+    months = tuple((f"{2022 + i // 12}-{i % 12 + 1:02d}", v) for i, v in enumerate(values))
+    return DatasetStats("합성_C", "합성 C(24개월 추세)", UNIT, 52000, sum(values), 41, "2022-01-01", "2023-12-31",
+                        months, sum(values), 0, ("합성 예시이며 실제 수치가 아닙니다.",))
 
 
 def write_markdown(stats_list, path):

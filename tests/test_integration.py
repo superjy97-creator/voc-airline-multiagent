@@ -29,7 +29,13 @@ from voc.contracts import (
 from voc.pipeline import DRY_RUN_LIMITS, HumanInput, RunContext, advance, new_run
 from voc.runners import FakeRunner
 from voc.sanitize import make_checked_text
-from voc.stats import load_summary, synthetic_stats, to_provenance, to_sanitized
+from voc.stats import (
+    load_summary,
+    synthetic_stats,
+    synthetic_trend_stats,
+    to_provenance,
+    to_sanitized,
+)
 
 SUMMARY = ROOT / "reports" / "stats_summary.json"
 V, D = ReviewVerdict, HumanDecision
@@ -143,6 +149,21 @@ class DashboardPartsTest(unittest.TestCase):
         self.assertIn("&lt;script&gt;", dashboard.kpi_html("<script>x</script>", "1", "blue"))
         self.assertIn("class=\"node pending\"", dashboard.flow_html(None))
 
+    def test_period_summary_and_chart_follow_the_selected_months(self):
+        stats = synthetic_trend_stats()
+        summary = dashboard.period_summary(stats, "2023-01", "2023-12")
+        assert summary is not None
+        self.assertEqual((summary["total"], summary["n"], summary["peak"]), (1532, 12, ("2023-08", 196)))
+        self.assertAlmostEqual(summary["change"], 3 / 101 * 100)
+        self.assertIsNone(dashboard.period_summary(stats, "2030-01", "2030-02"))
+        spec = dashboard.trend_chart(stats, ("2023-01", "2023-12")).to_dict()
+        bars, line = spec["layer"]
+        self.assertEqual(bars["mark"]["size"], 13)                          # 24개월용 막대 폭
+        self.assertEqual(bars["encoding"]["x"]["axis"]["format"], "%Y-%m")   # 날짜 축 형식
+        self.assertEqual(line["mark"]["type"], "line")                      # 이동평균 선
+        scopes = [row["scope"] for row in spec["datasets"][next(iter(spec["datasets"]))]]
+        self.assertEqual(scopes.count("분석 기간"), 12)
+
     def test_local_source_is_offered_only_when_the_summary_file_exists(self):
         self.assertEqual(dashboard.available_sources(ROOT / "nope" / "stats.json"),
                          [dashboard.SYNTHETIC_SOURCE])
@@ -163,7 +184,7 @@ class ScreenTest(unittest.TestCase):
     def test_full_flow_to_final_approval(self):
         at = self.app()
         self.assertFalse(at.exception)
-        at = self.click(at, "DRY_RUN 시작/다시 시작")
+        at = self.click(at, "분석 시작")
         self.assertFalse(at.exception)
         self.assertTrue(any("Human Review" in s.value for s in at.subheader))
         self.assertTrue(any("사람 검토 필요" in m.value for m in at.markdown))      # 에이전트 흐름 표시
@@ -191,16 +212,60 @@ class ScreenTest(unittest.TestCase):
         next(s for s in at.selectbox if s.label == "자료").set_value(labels[1])
         at = at.run()
         self.assertFalse(at.exception)                                 # StreamlitDuplicateElementId 회귀
-        at = self.click(at, "DRY_RUN 시작/다시 시작")
+        at = self.click(at, "분석 시작")
         self.assertFalse(at.exception)
         self.assertFalse(at.warning)
         next(s for s in at.selectbox if s.label == "자료").set_value(labels[0])
         at = at.run()
         self.assertFalse(at.exception)
-        self.assertTrue(any("다른 자료" in w.value for w in at.warning))
+        self.assertTrue(any("다른 조건" in w.value for w in at.warning))
+
+    def request_box(self, at):
+        return next(t for t in at.text_input if t.label == "자연어 요청")
+
+    def test_unsupported_free_text_is_rejected_without_running(self):
+        for text in ("실제 OpenAI API로 분석해 줘", "오늘 날씨 알려 줘", "상담 원문을 보여 줘",
+                     "추세와 급증 구간을 모두 보여 줘", ""):
+            with self.subTest(text=text):
+                at = self.app()
+                self.request_box(at).input(text)
+                at = at.run()
+                at = self.click(at, "분석 시작")
+                self.assertFalse(at.exception)
+                self.assertTrue(at.error)                                           # 거부 안내
+                self.assertFalse(any("Human Review" in s.value for s in at.subheader))   # 실행되지 않음
+                self.assertFalse(any("실행한 요청" in c.value for c in at.caption))
+
+    def test_supported_request_and_period_are_reflected_in_every_stage(self):
+        at = self.app()
+        self.request_box(at).input("급증 구간을 확인해 주세요")
+        at = at.run()
+        next(s for s in at.selectbox if s.label == "분석 시작월").set_value("2023-01")
+        at = at.run()
+        at = self.click(at, "분석 시작")
+        self.assertFalse(at.exception)
+        captions = " ".join(c.value for c in at.caption)
+        self.assertIn("실행한 요청: ‘급증 구간 확인’", captions)
+        self.assertIn("분석 기간 2023-01~2023-12", captions)
+        html = " ".join(m.value for m in at.markdown)
+        for expected in ("최대 2023-08 196건", "2023-07, 2023-08", "분석 기간 2023-01 ~ 2023-12 (12개월)", "1,532건"):
+            self.assertIn(expected, html)
+        labels = [e.label for e in at.expander]
+        for stage in ("Collector", "Analyst", "Writer 초안", "Reviewer"):
+            self.assertTrue(any(stage in label for label in labels), stage)           # 단계별 입력·출력
+        self.assertTrue(any("입력:" in m.value and "급증 구간 확인" in m.value for m in at.markdown))
+
+    def test_start_month_after_end_month_blocks_the_run(self):
+        at = self.app()
+        next(s for s in at.selectbox if s.label == "분석 시작월").set_value("2023-06")
+        next(s for s in at.selectbox if s.label == "분석 종료월").set_value("2023-01")
+        at = at.run()
+        self.assertTrue(any("시작월은 종료월보다" in e.value for e in at.error))
+        at = self.click(at, "분석 시작")
+        self.assertFalse(any("Human Review" in s.value for s in at.subheader))
 
     def test_screen_rejects_personal_information_in_notes(self):
-        at = self.click(self.app(), "DRY_RUN 시작/다시 시작")
+        at = self.click(self.app(), "분석 시작")
         at.radio[0].set_value("Writer에게 수정 요청")
         at.text_area[0].input("전화 010-1234-5678")
         at = self.click(at, "제출")

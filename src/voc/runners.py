@@ -1,4 +1,5 @@
 import json
+import statistics
 from collections.abc import Iterable
 from dataclasses import dataclass
 
@@ -32,6 +33,52 @@ def _report(*sections: tuple[str, str]) -> str:
 class _ReviewOutput:
     verdict: ReviewVerdict
     output_text: str
+
+
+def _facts(step: StageInput) -> dict | None:
+    """분석 요청 모드(분석_요청 필드와 월별 값이 있을 때)의 사실. 입력 필드의 값만 계산에 쓴다."""
+    fields = dict(step.sanitized.fields)
+    series = [(name[3:], value) for name, value in step.sanitized.fields if name.startswith("건수_")]
+    request = fields.get("분석_요청")
+    if request is None or not series:
+        return None
+    values = [value for _, value in series]
+    median = statistics.median(values)
+    return {
+        "request": request, "start": series[0][0], "end": series[-1][0], "n": len(series),
+        "total": sum(values), "avg": sum(values) / len(values), "median": median,
+        "peak": max(series, key=lambda p: p[1]), "low": min(series, key=lambda p: p[1]),
+        "spikes": [month for month, value in series if median and value >= 1.5 * median],
+        "change": (values[-1] - values[0]) / values[0] * 100 if values[0] else None,
+        "partial": fields.get("마지막월_부분집계") == "예", "scope": fields.get("자료범위", ""),
+    }
+
+
+_IMPROVEMENTS = {
+    "월별 추세 분석": "월별 건수 모니터링 기준(월 중앙값의 1.5배 이상)을 정해 변화를 일찍 확인합니다.",
+    "급증 구간 확인": "급증한 달 이전에 사전 안내와 상담 인력 배치를 점검합니다.",
+    "개선 방안 보고서": "월별 모니터링, 급증 달 사전 안내, 상담 응대 기준 점검을 단계적으로 검토합니다.",
+}
+
+
+def _request_report(f: dict) -> str:
+    change = f"{f['change']:+.1f}%" if f["change"] is not None else "계산 불가(첫 달 0건)"
+    spikes = ", ".join(f["spikes"]) if f["spikes"] else "없음"
+    facts = (f"- 분석 기간 {f['start']} ~ {f['end']} ({f['n']}개월), 합계 {f['total']:,}건, 월평균 {f['avg']:.1f}건\n"
+             f"- 최대 {f['peak'][0]} {f['peak'][1]:,}건 / 최소 {f['low'][0]} {f['low'][1]:,}건\n"
+             f"- 첫 달 대비 마지막 달 {change}\n"
+             f"- 월 중앙값 {f['median']:,.0f}건의 1.5배 이상인 달: {spikes}")
+    limit = "집계에는 불만 유형·원인 정보가 없습니다." + (" 마지막 달은 부분 집계입니다." if f["partial"] else "")
+    return _report(
+        ("개요", f"요청 ‘{f['request']}’ — 분석 기간 {f['start']}~{f['end']}. 자료 범위: {f['scope'] or '미지정'}."),
+        ("VOC 현황", "확인된 사실(입력된 집계값):\n" + facts),
+        ("핵심 원인", ("가설(DRY_RUN 예시) — 급증한 달에 안내·절차 변화나 외부 요인이 있었을 수 있으나, "
+                   "집계만으로 원인은 확인할 수 없습니다.")),
+        ("개선방안", "개선 방안 후보(DRY_RUN 예시, 효과는 통계로 확인 불가): " + _IMPROVEMENTS[f["request"]]),
+        ("실행 우선순위", "1) 급증한 달의 상담 유형·원인 자료 확인 2) 모니터링 기준 합의 3) 이후 월 변화 관찰"),
+        ("위험·한계", limit),
+        ("결론", "확인된 것은 월별 건수 변화뿐이며, 원인과 개선 효과는 추가 자료로 확인해야 합니다."),
+    )
 
 
 class FakeRunner:
@@ -70,7 +117,8 @@ class FakeRunner:
             f"{name} {value}" for name, value in step.sanitized.fields
             if name in {"건수", "비율", "기간"}
         )
-        output = _report(
+        facts = _facts(step)
+        output = _request_report(facts) if facts else _report(
             ("개요", "제공된 VOC 집계의 개선 검토 예시입니다."),
             ("VOC 현황", stats or "제공된 집계 수치가 없습니다."),
             ("핵심 원인", "가설(DRY_RUN 예시) — 안내 과정에 개선 여지가 있을 수 있습니다."),
@@ -89,6 +137,34 @@ class FakeRunner:
         return output
 
     def _summarize(self, step: StageInput) -> str:
+        facts = _facts(step)
+        if facts and step.stage is StageName.COLLECTOR:
+            return _report(
+                ("핵심 요약", (f"요청 ‘{facts['request']}’ · 기간 {facts['start']}~{facts['end']} · "
+                           f"월별 {facts['n']}개 값 · 합계 {facts['total']:,}건")),
+                ("유형·키워드", "집계에는 불만 유형 정보가 없습니다."),
+                ("감정 신호", "집계에서 확인할 수 없습니다."),
+                ("자료 품질·누락", "마지막 달 부분 집계" if facts["partial"] else "제공된 월별 집계만 확인했습니다."),
+                ("추가 확인사항", "급증한 달의 상담 유형·원인 자료가 필요합니다."),
+            )
+        if facts and step.stage is StageName.ANALYST:
+            spikes = ", ".join(facts["spikes"]) if facts["spikes"] else "없음"
+            return _report(
+                ("원인·근거", "집계만으로 원인을 확인할 수 없습니다."),
+                ("문제 우선순위", f"월 중앙값의 1.5배 이상인 달({spikes})을 먼저 확인합니다."),
+                ("고객 경험 영향", "추가 근거가 필요합니다."),
+                ("개선 가설", "급증한 달 전후의 안내·절차 변화를 점검할 수 있습니다(DRY_RUN 예시)."),
+                ("실무 조치 제안", _IMPROVEMENTS[facts["request"]]),
+                ("불확실성", "원인과 영향은 미확인입니다."),
+            )
+        if facts and step.stage is StageName.MANAGER:
+            return _report(
+                ("검수된 보고서 요약", f"요청 ‘{facts['request']}’에 대한 월별 집계 검토 예시입니다."),
+                ("개선 우선순위", "급증한 달의 원인 자료 확인 → 모니터링 기준 합의 → 변화 관찰"),
+                ("재검수 결과", "단계 기록에서 검수 판정을 확인합니다."),
+                ("미해결 위험", "원인과 개선 효과는 통계로 확인할 수 없습니다."),
+                ("사용자 최종 확인 필요사항", "보고서 및 검수 이력을 확인합니다."),
+            )
         if step.stage is StageName.COLLECTOR:
             summary = ", ".join(f"{name} {value}" for name, value in step.sanitized.fields)
             return _report(

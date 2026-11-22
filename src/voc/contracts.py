@@ -248,7 +248,9 @@ SCHEMAS = {
 # 아래 두 문장은 모델에 전달하는 '고정 지시'이며(범주값 1개), 자료에서 온 값이 아니다.
 REQUEST_SECTIONS = "월별변화·주요통계·확인가능한문제·원인가설·개선방안·기대효과를 구분해 작성"
 INTERPRETATION_RULE = "통계로 확인할 수 없는 불만유형·원인·효과는 가설로만 표기하고 단정하지 않음"
-SCOPES = frozenset({"전체 상담 접수", "온라인 상거래 상담", "위해위험 상담"})
+SCOPES = frozenset({"전체 상담 접수", "온라인 상거래 상담", "위해위험 상담", "합성 예시"})
+# 화면에서 지원하는 분석 요청(사전 정의). 사용자의 자유 입력은 이 중 하나로 매핑될 때만 쓰이며 문장 자체는 전달되지 않는다.
+ANALYSIS_REQUESTS = ("월별 추세 분석", "급증 구간 확인", "개선 방안 보고서")
 MONTHLY_FIELD_MONTHS = tuple(f"{y}-{m:02d}" for y in range(2010, 2031) for m in range(1, 13))
 SCHEMAS["voc_monthly_v1"] = {
     **SCHEMAS["voc_aggregate_v1"],
@@ -261,6 +263,9 @@ SCHEMAS["voc_monthly_v1"] = {
     "행수_상한_절단_가능성": FieldSpec("category", frozenset({"예", "미확인"})),
     "요청_절구성": FieldSpec("category", frozenset({REQUEST_SECTIONS})),
     "해석_원칙": FieldSpec("category", frozenset({INTERPRETATION_RULE})),
+    "분석기간_시작": FieldSpec("period"),
+    "분석기간_종료": FieldSpec("period"),
+    "분석_요청": FieldSpec("category", frozenset(ANALYSIS_REQUESTS)),
     **{f"건수_{month}": FieldSpec("count") for month in MONTHLY_FIELD_MONTHS},
 }
 
