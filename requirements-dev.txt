@@ -1,0 +1,10 @@
+-r requirements.txt
+
+# scripts/live_smoke.py(LIVE 점검, 합성 데이터 전용·사용자 승인 필요)에만 필요
+openai>=3
+openai-agents>=0.25
+python-dotenv>=1.0
+
+# 개발 도구
+ruff>=0.17
+pyright>=1.1.400

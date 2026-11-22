@@ -1,0 +1,29 @@
+# 비밀키·환경 설정
+.env
+.env.*
+*.env
+
+# 실제 VOC 자료, 집계 결과, LIVE 실행 상태·비용 기록·보고서 (저장소에 올리지 않는다)
+reports/
+presentation/
+voc_private_data/
+live_state*.json
+live_report.md
+*.csv
+*.parquet
+*.xlsx
+
+# 개발 도구 진입 파일(로컬 경로 포함)
+CLAUDE.md
+AGENTS.md
+.claude/
+
+# 파이썬·도구 캐시, 가상환경, 편집기 설정
+__pycache__/
+*.pyc
+.venv/
+venv/
+.ruff_cache/
+.pytest_cache/
+.vscode/
+.idea/
