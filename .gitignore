@@ -27,3 +27,6 @@ venv/
 .pytest_cache/
 .vscode/
 .idea/
+
+# 로컬 비밀값(API 키)
+.streamlit/secrets.toml

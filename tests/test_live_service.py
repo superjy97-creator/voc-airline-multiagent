@@ -17,7 +17,6 @@ from voc.stats import synthetic_trend_stats
 
 PERIOD = ("2022-01", "2023-12")
 REQUEST = "월별 추세 분석"
-PASSWORD = "correct-horse-battery"
 KEY = "sk-test-NOT-A-REAL-KEY-0000"
 
 
@@ -70,9 +69,9 @@ class LiveServiceTest(unittest.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
         self.store = svc.LiveStore(Path(folder.name))
-        self.settings = svc.LiveSettings(KEY, PASSWORD)
-        self.gate = svc.AdminGate(PASSWORD)
-        self.token = self.gate.login(PASSWORD)
+        self.settings = svc.LiveSettings(KEY)
+        self.gate = svc.LocalGate(True)
+        self.token = self.gate.issue()
         self.stats = synthetic_trend_stats()
         self.plan = svc.build_plan(self.stats, PERIOD, REQUEST, (0.10, 0.50))
 
@@ -93,43 +92,55 @@ class LiveServiceTest(unittest.TestCase):
                          self.view().stage_count if count is None else count, HumanInput(decision, notes),
                          client_factory)
 
-    # ---- 설정·관리자 인증 ----
-    def test_settings_require_key_password_and_safe_prices(self):
-        values = {"OPENAI_API_KEY": KEY, "ADMIN_PASSWORD": PASSWORD}
+    # ---- 설정·로컬 접근 제한 ----
+    def test_settings_need_only_the_key_and_reject_cheap_prices(self):
+        values = {"OPENAI_API_KEY": KEY}
         self.assertIsNone(svc.load_settings({}.get))
-        self.assertIsNone(svc.load_settings({"OPENAI_API_KEY": KEY}.get))
-        self.assertIsNone(svc.load_settings({"ADMIN_PASSWORD": PASSWORD}.get))
+        self.assertIsNone(svc.load_settings({"OPENAI_API_KEY": "  "}.get))
         loaded = svc.load_settings(values.get)
         assert loaded is not None
         self.assertNotIn(KEY, repr(loaded))
-        self.assertNotIn(PASSWORD, repr(loaded))
-        with self.assertRaises(svc.LiveError):
-            svc.load_settings({**values, "ADMIN_PASSWORD": "short"}.get)
+        self.assertFalse(hasattr(loaded, "admin_password"))
         with self.assertRaises(svc.LiveError):
             svc.load_settings({**values, "PRICE_OUT_PER_M": "0.01"}.get)
         priced = svc.load_settings({**values, "PRICE_IN_PER_M": "0.2"}.get)
         assert priced is not None
         self.assertEqual(priced.price_in, 0.2)
 
-    def test_gate_rejects_wrong_password_locks_out_and_expires(self):
+    def test_local_access_only_for_loopback_server_host_and_non_cloud_path(self):
+        ok = ("localhost", "localhost:8501", r"C:\lab3\voc_consumer_analysis")
+        self.assertTrue(svc.local_access(*ok))
+        self.assertTrue(svc.local_access("127.0.0.1", "127.0.0.1:8501", "/home/me/app"))
+        self.assertTrue(svc.local_access("::1", "[::1]:8501", "/home/me/app"))
+        for address, host, path in (
+            (None, "localhost:8501", "/home/me/app"),                        # 바인딩 주소를 알 수 없음
+            ("0.0.0.0", "localhost:8501", "/home/me/app"),                   # 모든 인터페이스에 열린 서버
+            ("localhost", "voc-airline-ai.streamlit.app", "/home/me/app"),   # 공개 도메인으로 접속
+            ("localhost", None, "/home/me/app"),                             # Host를 알 수 없음
+            ("localhost", "evil.com", "/home/me/app"),
+            ("localhost", "localhost:8501", "/mount/src/voc-airline-multiagent"),   # Streamlit Cloud 경로
+        ):
+            with self.subTest(address=address, host=host, path=path):
+                self.assertFalse(svc.local_access(address, host, path))
+
+    def test_gate_issues_tokens_only_when_allowed_and_expires(self):
+        closed = svc.LocalGate(False)
+        self.assertIsNone(closed.issue())
+        self.assertFalse(closed.valid("forged"))
+        with self.assertRaises(svc.LiveError):
+            closed.require("forged")
         now = [0.0]
-        gate = svc.AdminGate(PASSWORD, max_failures=3, lockout_seconds=60, session_seconds=100, clock=lambda: now[0])
-        self.assertIsNone(gate.login("wrong"))
+        gate = svc.LocalGate(True, session_seconds=100, clock=lambda: now[0])
+        token = gate.issue()
+        self.assertTrue(gate.valid(token))
         self.assertFalse(gate.valid("forged-token"))
         self.assertFalse(gate.valid(None))
-        for _ in range(2):
-            gate.login("wrong")
-        with self.assertRaises(svc.LiveError):
-            gate.login(PASSWORD)            # 잠금 중에는 맞는 암호도 거부
-        now[0] = 61
-        token = gate.login(PASSWORD)
-        self.assertTrue(gate.valid(token))
         now[0] = 200
         self.assertFalse(gate.valid(token))
         with self.assertRaises(svc.LiveError):
             gate.require(token)
 
-    # ---- 인증 없이는 호출·기록 불가 ----
+    # ---- 접근 토큰 없이는 호출·기록 불가 ----
     def test_no_valid_token_means_no_client_no_call_no_state(self):
         for bad in (None, "", "forged", "x" * 43):
             with self.subTest(token=bad), self.assertRaises(svc.LiveError):
@@ -157,7 +168,7 @@ class LiveServiceTest(unittest.TestCase):
     def test_cost_over_cap_blocks_before_any_call(self):
         expensive = svc.build_plan(self.stats, PERIOD, REQUEST, (30.0, 60.0))
         self.assertFalse(expensive.ok)
-        self.settings = svc.LiveSettings(KEY, PASSWORD, 30.0, 60.0)
+        self.settings = svc.LiveSettings(KEY, 30.0, 60.0)
         with self.assertRaises(svc.LiveError):
             self.start(typed_code=expensive.code)
         self.assertEqual((FakeSdk.instances, self.store.exists()), ([], False))
@@ -227,7 +238,6 @@ class LiveServiceTest(unittest.TestCase):
         self.start()
         text = self.store.state_path.read_text(encoding="utf-8")
         self.assertNotIn(KEY, text)
-        self.assertNotIn(PASSWORD, text)
 
     # ---- 중복·새로고침·동시 실행 ----
     def test_second_start_is_refused_and_existing_record_preserved(self):

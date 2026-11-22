@@ -1,15 +1,15 @@
 """웹 LIVE 서비스(합성 데이터 전용): 관리자 인증·승인 코드·1회 실행 장부·중복 호출 방지.
 
 원칙(모두 서버 측에서 강제):
-- 관리자 인증 토큰이 없으면 어떤 LIVE 함수도 동작하지 않는다(키·네트워크 접근 이전에 차단).
-- OPENAI_API_KEY·관리자 암호는 `LiveSettings`(repr 숨김)에만 있고 화면·상태 파일·오류 메시지에 쓰지 않는다.
+- 접근 제한: 비밀번호 없이, 서버가 이 PC(loopback)에서만 열려 있는 로컬 실행에서만 LIVE가 열린다.
+  공개 배포(Streamlit Cloud 등)에서는 키가 있어도 열리지 않는다(`local_access`). 토큰이 없으면 어떤 LIVE 함수도 동작하지 않는다.
+- OPENAI_API_KEY는 `LiveSettings`(repr 숨김)에만 있고 화면·상태 파일·오류 메시지에 쓰지 않는다.
 - 전송 입력은 합성 집계(`to_sanitized_monthly`)뿐이며 자유 입력·상담 원문은 스키마상 담을 수 없다.
 - 실행 장부(상태 파일)가 있으면 새 실행을 시작하지 않는다. 배타 잠금 파일이 있으면 어떤 호출도 하지 않는다.
 - 호출 직전에 '진행 중' 표시를 먼저 저장해, 도중에 끊겨도 같은 호출이 다시 나가지 않는다(fail-closed).
 """
 
 import hashlib
-import hmac
 import json
 import os
 import secrets
@@ -58,7 +58,7 @@ OPENAI_URL = "https://api.openai.com/v1"
 PRICE_FLOOR = (0.10, 0.50)      # 사용자가 승인한 100만 토큰당 단가(입력, 출력). 이보다 낮은 설정은 거부한다.
 MAX_OUTPUT_TOKENS = 2500
 INPUT_CAP_CHARS = 10_000   # 호출당 입력 글자 상한. 첫 실제 실행에서 4,000자는 Reviewer 입력(약 6,450자)보다 작아 차단됐다.
-MIN_PASSWORD_CHARS = 12
+LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
 STATE_NAME, LOCK_NAME = "live_web_state.json", "live_web.lock"
 
 
@@ -69,19 +69,15 @@ class LiveError(Exception):
 @dataclass(frozen=True)
 class LiveSettings:
     api_key: str = field(repr=False)
-    admin_password: str = field(repr=False)
     price_in: float = PRICE_FLOOR[0]
     price_out: float = PRICE_FLOOR[1]
 
 
 def load_settings(get: Callable[[str], object]) -> LiveSettings | None:
-    """서버 비밀값에서 설정을 읽는다. 키나 관리자 암호가 없으면 None(LIVE 비활성)."""
+    """서버 비밀값에서 설정을 읽는다. 키가 없으면 None(LIVE 비활성). 단가는 승인된 값 이상만 허용한다."""
     key = str(get("OPENAI_API_KEY") or "").strip()
-    password = str(get("ADMIN_PASSWORD") or "")
-    if not key or not password:
+    if not key:
         return None
-    if len(password) < MIN_PASSWORD_CHARS:
-        raise LiveError(f"관리자 암호는 {MIN_PASSWORD_CHARS}자 이상이어야 합니다. LIVE를 비활성화합니다.")
     try:
         price_in = float(str(get("PRICE_IN_PER_M") or PRICE_FLOOR[0]))
         price_out = float(str(get("PRICE_OUT_PER_M") or PRICE_FLOOR[1]))
@@ -89,42 +85,49 @@ def load_settings(get: Callable[[str], object]) -> LiveSettings | None:
         raise LiveError("단가 설정이 숫자가 아닙니다. LIVE를 비활성화합니다.") from error
     if price_in < PRICE_FLOOR[0] or price_out < PRICE_FLOOR[1]:
         raise LiveError("설정한 단가가 승인된 단가보다 낮아 비용을 과소평가할 수 있습니다. LIVE를 비활성화합니다.")
-    return LiveSettings(key, password, price_in, price_out)
+    return LiveSettings(key, price_in, price_out)
 
 
-class AdminGate:
-    """관리자 인증. 프로세스 전체에서 실패 횟수를 세어 잠그고, 발급한 토큰만 유효하다."""
+def _host_only(value: str | None) -> str:
+    text = (value or "").strip().lower()
+    if text.startswith("["):                      # [::1]:8501
+        return text[1:text.find("]")] if "]" in text else text
+    return text.rsplit(":", 1)[0] if text.count(":") == 1 else text
 
-    def __init__(self, password: str, *, max_failures: int = 5, lockout_seconds: float = 900,
-                 session_seconds: float = 1800, clock: Callable[[], float] = time.monotonic) -> None:
-        self._digest = hashlib.sha256(password.encode("utf-8")).digest()
-        self._max_failures, self._lockout, self._session = max_failures, lockout_seconds, session_seconds
-        self._clock = clock
-        self._failures, self._locked_until = 0, 0.0
+
+def local_access(server_address: str | None, host_header: str | None, app_dir: str | Path) -> bool:
+    """이 PC에서만 열린 로컬 실행인지 서버 측 사실로 판정한다(공개 배포는 항상 False).
+
+    세 조건을 모두 만족해야 한다: ① 서버 바인딩 주소가 loopback ② 요청 Host가 loopback
+    ③ 앱이 Streamlit Cloud 경로(/mount/)가 아닌 곳에서 실행. 하나라도 어긋나면 LIVE는 열리지 않는다.
+    """
+    if _host_only(server_address) not in LOOPBACK_HOSTS or _host_only(host_header) not in LOOPBACK_HOSTS:
+        return False
+    return not str(app_dir).replace("\\", "/").startswith("/mount/")
+
+
+class LocalGate:
+    """로컬 접근 토큰 발급기. 허용되지 않은 환경에서는 토큰을 발급하지 않는다."""
+
+    def __init__(self, allowed: bool, *, session_seconds: float = 3600,
+                 clock: Callable[[], float] = time.monotonic) -> None:
+        self._allowed, self._session, self._clock = bool(allowed), session_seconds, clock
         self._tokens: dict[str, float] = {}
         self._mutex = threading.Lock()
 
-    def login(self, attempt: str) -> str | None:
-        with self._mutex:
-            now = self._clock()
-            if now < self._locked_until:
-                raise LiveError("로그인 시도가 너무 많아 잠시 잠겼습니다. 나중에 다시 시도하세요.")
-            candidate = hashlib.sha256(str(attempt).encode("utf-8")).digest()
-            if hmac.compare_digest(candidate, self._digest):
-                self._failures = 0
-                token = secrets.token_urlsafe(32)
-                self._tokens[token] = now + self._session
-                return token
-            self._failures += 1
-            if self._failures >= self._max_failures:
-                self._failures, self._locked_until = 0, now + self._lockout
+    def issue(self) -> str | None:
+        if not self._allowed:
             return None
+        with self._mutex:
+            token = secrets.token_urlsafe(32)
+            self._tokens[token] = self._clock() + self._session
+            return token
 
     def valid(self, token: object) -> bool:
         with self._mutex:
             now = self._clock()
             self._tokens = {t: e for t, e in self._tokens.items() if e > now}
-            return isinstance(token, str) and token in self._tokens
+            return self._allowed and isinstance(token, str) and token in self._tokens
 
     def logout(self, token: object) -> None:
         with self._mutex:
@@ -133,11 +136,12 @@ class AdminGate:
 
     def require(self, token: object) -> None:
         if not self.valid(token):
-            raise LiveError("관리자 인증이 필요합니다.")
+            raise LiveError("이 환경에서는 LIVE를 실행할 수 없습니다(로컬 실행에서만 허용).")
 
 
 def default_store_dir() -> Path:
-    return Path(tempfile.gettempdir()) / "voc_live"
+    reports = Path(__file__).resolve().parents[2] / "reports"      # 로컬 프로젝트에만 있고 저장소에는 올라가지 않는다
+    return reports / "live_web" if reports.is_dir() else Path(tempfile.gettempdir()) / "voc_live"
 
 
 class LiveStore:
@@ -279,7 +283,7 @@ def _make_context(settings: LiveSettings, stats, meta: dict, budget: CallBudget,
     return ctx, logging, est, prices
 
 
-def start_run(store: LiveStore, gate: AdminGate, token: object, settings: LiveSettings, stats,
+def start_run(store: LiveStore, gate: LocalGate, token: object, settings: LiveSettings, stats,
               period: tuple[str, str], request: str, typed_code: str,
               client_factory: Callable = default_client) -> None:
     gate.require(token)
@@ -326,7 +330,7 @@ class LiveView:
     stage_count: int
 
 
-def load_view(store: LiveStore, gate: AdminGate, token: object) -> LiveView | None:
+def load_view(store: LiveStore, gate: LocalGate, token: object) -> LiveView | None:
     gate.require(token)
     data = store.read()
     if data is None:
@@ -340,7 +344,7 @@ def load_view(store: LiveStore, gate: AdminGate, token: object) -> LiveView | No
     return LiveView(result, usage, errors, data["meta"], bool(data.get("inflight")), spent, len(result.stages))
 
 
-def continue_run(store: LiveStore, gate: AdminGate, token: object, settings: LiveSettings,
+def continue_run(store: LiveStore, gate: LocalGate, token: object, settings: LiveSettings,
                  expected_stage_count: int, human: HumanInput,
                  client_factory: Callable = default_client) -> None:
     """Human Review 결정을 반영해 이어서 실행한다. 화면이 오래된 요청(새로고침·중복 클릭)은 호출 없이 거부한다."""
@@ -365,7 +369,7 @@ def continue_run(store: LiveStore, gate: AdminGate, token: object, settings: Liv
         _advance_and_save(store, result, ctx, logging, budget, errors, human, meta)
 
 
-def finalize(store: LiveStore, gate: AdminGate, token: object, approve: bool) -> None:
+def finalize(store: LiveStore, gate: LocalGate, token: object, approve: bool) -> None:
     """최종 승인/반려(호출 없음). 사용자의 결정만 기록한다."""
     gate.require(token)
     with store.locked():

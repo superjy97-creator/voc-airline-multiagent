@@ -296,17 +296,16 @@ class PublicAppStructureTest(unittest.TestCase):
 
     def test_app_has_no_env_or_key_reads(self):
         text = (Path(__file__).resolve().parents[1] / "app.py").read_text(encoding="utf-8")
-        for token in ("getenv", "os.environ", "SdkRunner", "OPENAI_API_KEY", "import openai", "from openai"):
+        for token in ("getenv", "os.environ", "SdkRunner", "import openai", "from openai", "st.write(st.secrets"):
             self.assertNotIn(token, text)
         self.assertEqual(text.count("st.secrets"), 1)      # 비밀값 읽기는 _secret() 한 곳뿐
 
 
 KEY = "sk-test-NOT-A-REAL-KEY-0000"
-PASSWORD = "correct-horse-battery"
 
 
 class LiveScreenTest(unittest.TestCase):
-    """LIVE 화면: 인증·승인 코드 없이는 어떤 호출도 없고, 인증 후 합성 데이터 흐름이 끝까지 동작한다."""
+    """LIVE 화면: 공개 환경에서는 키가 있어도 닫히고, 로컬 실행에서만 승인 코드 뒤에 합성 데이터 흐름이 동작한다."""
 
     def setUp(self):
         import tempfile
@@ -316,7 +315,8 @@ class LiveScreenTest(unittest.TestCase):
         self.fake = FakeSdk
         folder = tempfile.TemporaryDirectory()
         self.addCleanup(folder.cleanup)
-        for patcher in (patch("tempfile.tempdir", folder.name), patch("voc.live_service.SdkRunner", FakeSdk),
+        for patcher in (patch("voc.live_service.default_store_dir", return_value=Path(folder.name) / "voc_live"),
+                        patch("voc.live_service.SdkRunner", FakeSdk),
                         patch.object(socket, "getaddrinfo", side_effect=AssertionError("네트워크 금지")),
                         patch.object(socket, "create_connection", side_effect=AssertionError("네트워크 금지"))):
             patcher.start()
@@ -326,14 +326,17 @@ class LiveScreenTest(unittest.TestCase):
         self.addCleanup(st.cache_resource.clear)
         self.state = Path(folder.name) / "voc_live" / "live_web_state.json"
 
-    def app(self, secrets=True, live=True):
+    def app(self, *, key=True, local=False, live=True):
+        """local=True면 로컬(loopback) 실행으로 판정되도록 접근 판정만 대체한다(그 판정 자체는 서비스 테스트가 검증)."""
         at = AppTest.from_file(str(ROOT / "app.py"), default_timeout=60)
-        if secrets:
+        if key:
             at.secrets["OPENAI_API_KEY"] = KEY
-            at.secrets["ADMIN_PASSWORD"] = PASSWORD
+        patcher = patch("voc.live_service.local_access", return_value=local)
+        patcher.start()
+        self.addCleanup(patcher.stop)
         at.run()
         if live:
-            next(r for r in at.sidebar.radio if r.label == "실행 모드").set_value("LIVE (관리자 전용)")
+            next(r for r in at.sidebar.radio if r.label == "실행 모드").set_value("LIVE (로컬 전용)")
             at.run()
         return at
 
@@ -358,62 +361,46 @@ class LiveScreenTest(unittest.TestCase):
         self.assertNotIn("LIVE —", self.page(at))
         self.assertIn("DRY_RUN 모드", self.page(at))
 
-    def test_live_without_server_settings_is_disabled(self):
-        at = self.app(secrets=False)
-        self.assertFalse(at.exception)
-        self.assertIn("서버 설정이 없어 비활성", self.page(at))
-        self.assertEqual([t.label for t in at.text_input if "암호" in t.label], [])
-        self.assertTrue(next(b for b in at.button if b.label == "분석 시작").disabled)
-        self.assertEqual(self.fake.instances, [])
-
-    def test_live_requires_admin_login_before_any_plan_or_call(self):
-        at = self.app()
+    def test_public_environment_keeps_live_closed_even_with_api_key(self):
+        at = self.app(key=True, local=False)
         text = self.page(at)
-        self.assertIn("관리자 암호", [t.label for t in at.text_input])
-        for hidden in ("승인 코드", "승인 요청서", KEY, PASSWORD):
+        self.assertFalse(at.exception)
+        self.assertIn("로컬 화면에서만 열립니다", text)
+        for hidden in ("승인 코드", "승인 요청서", KEY):
             self.assertNotIn(hidden, text)
-        at = self.type_into(at, "관리자 암호", "wrong-password-123")
-        at = self.click(at, "관리자 로그인")
-        self.assertIn("암호가 올바르지 않습니다", self.page(at))
-        self.assertNotIn("승인 코드", self.page(at))
+        self.assertEqual([b.label for b in at.button if "LIVE 시작" in b.label], [])
+        self.assertTrue(next(b for b in at.button if b.label == "분석 시작").disabled)
         self.assertEqual((self.fake.instances, self.state.exists()), ([], False))
 
-    def test_login_shows_plan_and_wrong_code_makes_no_call(self):
-        at = self.app()
-        at = self.type_into(at, "관리자 암호", PASSWORD)
-        at = self.click(at, "관리자 로그인")
+    def test_local_without_api_key_is_disabled(self):
+        at = self.app(key=False, local=True)
+        self.assertFalse(at.exception)
+        self.assertIn("OPENAI_API_KEY)이 없어 비활성", self.page(at))
+        self.assertEqual(self.fake.instances, [])
+
+    def test_local_shows_plan_and_wrong_code_makes_no_call(self):
+        at = self.app(local=True)
         text = self.page(at)
         self.assertIn("실행 직전 승인 요청서", text)
         self.assertIn("gpt-6-luna", text)
         self.assertNotIn(KEY, text)
-        self.assertNotIn(PASSWORD, text)
         at = self.type_into(at, "승인 코드", "WRONG000")
         at = self.click(at, "승인하고 LIVE 시작(유료 호출)")
         self.assertIn("승인 코드가 일치하지 않아 호출하지 않았습니다", self.page(at))
         self.assertEqual((self.fake.instances, self.state.exists()), ([], False))
 
-    def test_real_dataset_live_is_blocked_after_login(self):
-        at = self.app()
-        at = self.type_into(at, "관리자 암호", PASSWORD)
-        at = self.click(at, "관리자 로그인")
-        self.assertNotIn("실제 집계 자료의 LIVE는", self.page(at))      # 합성 자료에서는 안내가 없다
-        self.assertEqual(self.fake.instances, [])
-
     def test_full_live_flow_with_fake_sdk(self):
         from voc import live_service as svc
         from voc.stats import synthetic_trend_stats
         stats = synthetic_trend_stats()
-        months = [m for m in (f"{y}-{i:02d}" for y in (2022, 2023) for i in range(1, 13))]
+        months = [f"{y}-{i:02d}" for y in (2022, 2023) for i in range(1, 13)]
         code = svc.build_plan(stats, (months[0], months[-1]), "월별 추세 분석", (0.10, 0.50)).code
-        at = self.app()
-        at = self.type_into(at, "관리자 암호", PASSWORD)
-        at = self.click(at, "관리자 로그인")
+        at = self.app(local=True)
         at = self.type_into(at, "승인 코드", code)
         at = self.click(at, "승인하고 LIVE 시작(유료 호출)")
         self.assertFalse(at.exception)
         self.assertEqual(len(self.fake.calls), 4)
         self.assertTrue(any("Human Review" in s.value for s in at.subheader))
-        self.assertIn("LIVE: 실제 API 호출", self.page(at) + " ".join(str(p.text) for p in at.get("progress")))
         at = self.click(at, "제출하고 다음 단계 실행(유료 호출)")
         self.assertEqual(len(self.fake.calls), 5)
         self.assertTrue(any("최종 승인" in s.value for s in at.subheader))
@@ -421,10 +408,8 @@ class LiveScreenTest(unittest.TestCase):
         self.assertTrue(any("최종 승인됨" in s.value for s in at.success))
         self.assertTrue(at.get("download_button"))
         self.assertEqual(len(self.fake.calls), 5)
-        # 새로고침(새 세션)과 두 번째 시작은 호출을 만들지 않는다
-        fresh = self.app()
-        fresh = self.type_into(fresh, "관리자 암호", PASSWORD)
-        fresh = self.click(fresh, "관리자 로그인")
+        # 새로고침(새 세션)에서는 시작 버튼이 없고 호출도 없다
+        fresh = self.app(local=True)
         self.assertFalse(any(b.label == "승인하고 LIVE 시작(유료 호출)" for b in fresh.button))
         self.assertEqual(len(self.fake.calls), 5)
         self.assertNotIn(KEY, self.state.read_text(encoding="utf-8"))
